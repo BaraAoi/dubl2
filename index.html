@@ -2170,6 +2170,8 @@
     .boot.is-ready {
       opacity: 0;
       visibility: hidden;
+      /* Пока экран растворяется, он не должен перехватывать клики по меню. */
+      pointer-events: none;
     }
 
     .boot-box {
