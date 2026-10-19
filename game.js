@@ -1,5 +1,5 @@
 /* ============================================================================
-   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть III
+   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть IV
    ----------------------------------------------------------------------------
    Единый ES-модуль игры (ванильный JS + Three.js r161 + PeerJS 1.5).
    index.html содержит CSS и DOM; этот файл — вся логика:
@@ -15,7 +15,12 @@
      VoiceChat         — WebRTC-голос, позиционное аудио, «рация»
      PassengerNPC      — сидящий пассажир, позы и «кровавые» материалы
      VoiceWatcher      — распознавание ru-RU и детектор крика
-     DemonDirector     — пробуждение, погоня, захват и Game Over
+     DemonDirector     — пробуждение, погоня, захват, переноска и Game Over
+     TicketInspector   — проверка билетов у четырёх пассажиров
+     MissionDirector   — инструктаж и сюжетные цели смены
+     DoorDirector      — переход между вагонами
+     BrakeDirector     — тормозной кран как способ спастись
+     LobbyDirectory    — каталог открытых лобби в обход ручного кода
      UIManager         — экраны, HUD, настройки, микрофон
      Game              — сборка и жизненный цикл
    ========================================================================== */
@@ -29,8 +34,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 // =============================================================================
 
 const CONFIG = {
-  version: '0.3.0',
-  part: 3,
+  version: '0.4.0',
+  part: 4,
   car: {
     width: 3.8,          // внутренняя ширина
     length: 32,          // внутренняя длина
@@ -127,7 +132,7 @@ const CONFIG = {
     fadeStart: 9.5,
     fadeEnd: 14,
     nametagDistance: 22,
-    radioGain: 0.9,
+    radioGain: 0.68,
   },
   // ---------------------------------------------------------------------
   // Часть III. «Пассажир», который едет в вагоне.
@@ -137,12 +142,22 @@ const CONFIG = {
     seat: { x: -1.44, y: 0.47, z: 5.55 },
     lookDistance: 4.4,
     grabDistance: 3.0,
-    // Волочение тяжёлого тела: доля обычной скорости.
-    dragScale: 0.34,
+    // Волочение тяжёлого тела. В одиночку — почти ползком, вдвоём — заметно
+    // быстрее: тело действительно тяжёлое, а не «как за двоих».
+    dragScale: 0.24,
+    dragScaleTwo: 0.5,
+    dragScaleHelper: 0.5,
     dragOffset: 0.92,
     dragLerp: 9.5,
     // Сколько секунд тело остаётся обмякшим после захвата.
     stunTime: 6.0,
+    // Билеты четырёх пассажиров (места в салоне).
+    seats: [
+      { x: -1.44, z: -4.95, yaw: Math.PI / 2, name: 'ГУСЕВ А. П.', seat: '02', serial: 'А-0441' },
+      { x: 1.44, z: -9.9, yaw: -Math.PI / 2, name: 'РЯБИНИНА М. С.', seat: '07', serial: 'Б-1180' },
+      { x: 1.44, z: 0, yaw: -Math.PI / 2, name: 'КОРНЕЕВ Д. В.', seat: '08', serial: 'В-0927' },
+      { x: -1.44, z: 9.9, yaw: Math.PI / 2, name: 'ШТЕРН Ф. А.', seat: '11', serial: 'Г-0063' },
+    ],
   },
   demon: {
     huntSpeed: 4.15,
@@ -152,6 +167,12 @@ const CONFIG = {
     bodyRadius: 0.3,
     standTime: 0.9,
     stateInterval: 0.05,
+    // Через сколько секунд демон поймёт, что цель ушла в соседний вагон.
+    transferDelay: 2.4,
+  },
+  mission: {
+    interactDistance: 2.7,
+    brakeHold: 2.4,
   },
   speech: {
     lang: 'ru-RU',
@@ -256,6 +277,8 @@ const DEFAULT_SETTINGS = Object.freeze({
   // откатывается на PeerJS Cloud. 'peerjs' — принудительно старый путь.
   netTransport: 'auto', // 'auto' | 'mqtt' | 'torrent' | 'nostr' | 'peerjs'
   relayCustom: '',
+  // Антиэхо: приглушать чужой голос, когда ваш микрофон слышит динамики.
+  echoGuard: true,
 });
 
 const NET_TRANSPORTS = ['auto', 'mqtt', 'torrent', 'nostr', 'peerjs'];
@@ -1808,6 +1831,12 @@ class TrainCar {
     };
     this.spawn = { ...CONFIG.player.spawn };
     this.colliders = [];
+    // Копия коллизий нужна, чтобы служебный вагон мог убрать скамьи
+    // и вернуть их при возвращении обратно.
+    this._baseColliders = null;
+    this._serviceColliders = [];
+    this.variant = 0;
+    this._serviceProps = null;
 
     this.swayTargets = [];
     this.dust = null;
@@ -3251,8 +3280,9 @@ class TrainCar {
     const power = 1 - clamp(this.blackout, 0, 1);
 
     if (this.centralLight) {
+      const serviceDim = this.variant === 1 ? 0.42 : 1;
       this.centralLight.intensity = this.centralBaseIntensity
-        * this._flickerValue * (1 - dread * 0.52) * power;
+        * this._flickerValue * (1 - dread * 0.52) * power * serviceDim;
     }
     if (this.lampMainMaterial) {
       this.lampMainMaterial.emissiveIntensity = (0.75 + 1.35 * this._flickerValue)
@@ -3318,6 +3348,132 @@ class TrainCar {
       points.geometry.attributes.position.needsUpdate = true;
     }
 
+  }
+
+  /**
+   * Логический вагон: 0 — пассажирский, 1 — служебный.
+   * Служебный: скамьи убраны, вдоль стен ящики и мешки, свет приглушён.
+   */
+  setCarVariant(index) {
+    const next = index === 1 ? 1 : 0;
+    if (this.variant === next) return;
+    if (!this._baseColliders) this._baseColliders = this.colliders.slice();
+    this.variant = next;
+    if (next === 1) {
+      this._ensureServiceProps();
+      // Скамьи остаются под брезентом — коллизии сохраняем.
+      this.colliders = this._baseColliders.concat(this._serviceColliders);
+    } else {
+      this.colliders = this._baseColliders.slice();
+    }
+    for (const child of this.group.children) {
+      if (child.name === 'Скамья') child.visible = next === 0;
+    }
+    if (this._serviceProps) this._serviceProps.visible = next === 1;
+    if (this.renderer) this.renderer.shadowMap.needsUpdate = true;
+  }
+
+  _ensureServiceProps() {
+    if (this._serviceProps) return;
+    const group = new THREE.Group();
+    group.name = 'Служебный вагон';
+    this.group.add(group);
+
+    const crateMat = new THREE.MeshStandardMaterial({ color: 0x4a3a26, roughness: 0.93 });
+    const crateEdge = new THREE.MeshStandardMaterial({ color: 0x2a2015, roughness: 0.9 });
+    const sackMat = new THREE.MeshStandardMaterial({ color: 0x3e3b32, roughness: 0.99 });
+
+    const addCrate = (x, z, size, yaw) => {
+      const crate = new THREE.Group();
+      crate.position.set(x, 0, z);
+      crate.rotation.y = yaw;
+      const box = new THREE.Mesh(new THREE.BoxGeometry(size, size * 0.82, size * 0.86), crateMat);
+      box.position.y = size * 0.41;
+      box.castShadow = true;
+      crate.add(box);
+      for (const offset of [-0.14, 0.14]) {
+        const band = new THREE.Mesh(
+          new THREE.BoxGeometry(size * 1.02, size * 0.05, size * 0.88),
+          crateEdge,
+        );
+        band.position.y = size * (0.5 + offset);
+        crate.add(band);
+      }
+      group.add(crate);
+      this._serviceColliders.push({
+        minX: x - size * 0.55,
+        maxX: x + size * 0.55,
+        minZ: z - size * 0.5,
+        maxZ: z + size * 0.5,
+        type: 'cargo',
+      });
+    };
+
+    // Брезент поверх скамей: вагон читается как служебный, без перестройки мира.
+    const tarpMat = new THREE.MeshStandardMaterial({ color: 0x33372e, roughness: 0.99 });
+    const strapMat = new THREE.MeshStandardMaterial({ color: 0x1d1f19, roughness: 0.9 });
+    for (const side of [-1, 1]) {
+      for (const centerZ of [-9.9, -4.95, 0, 4.95, 9.9]) {
+        const tarp = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.5, 3.42), tarpMat);
+        tarp.position.set(side * 1.43, 0.62, centerZ);
+        tarp.castShadow = true;
+        group.add(tarp);
+        for (const offset of [-1.12, 0, 1.12]) {
+          const strap = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.04, 0.07), strapMat);
+          strap.position.set(side * 1.43, 0.88, centerZ + offset);
+          group.add(strap);
+        }
+        const tag = new THREE.Mesh(
+          new THREE.PlaneGeometry(0.2, 0.12),
+          new THREE.MeshStandardMaterial({ color: 0xcfc6a6, roughness: 0.95, emissive: 0x2a2618, emissiveIntensity: 0.2 }),
+        );
+        tag.position.set(side * 1.08, 0.7, centerZ + 1.2);
+        tag.rotation.y = side * -Math.PI / 2;
+        group.add(tag);
+      }
+    }
+
+    addCrate(-1.28, -12.4, 0.62, 0.12);
+    addCrate(-1.3, -11.3, 0.5, -0.3);
+    addCrate(1.3, 4.8, 0.66, 0.2);
+    addCrate(1.28, 6.0, 0.54, -0.06);
+    addCrate(-1.25, 7.4, 0.58, 0.34);
+
+    for (const [x, z, s] of [[1.26, -3.2, 0.5], [1.3, -2.1, 0.42], [-1.3, 1.2, 0.46]]) {
+      const sack = new THREE.Mesh(new THREE.CapsuleGeometry(s * 0.44, s * 0.5, 4, 10), sackMat);
+      sack.position.set(x, s * 0.5, z);
+      sack.rotation.z = 0.12;
+      sack.castShadow = true;
+      group.add(sack);
+      this._serviceColliders.push({
+        minX: x - s * 0.5,
+        maxX: x + s * 0.5,
+        minZ: z - s * 0.5,
+        maxZ: z + s * 0.5,
+        type: 'cargo',
+      });
+    }
+
+    // Служебный фонарь над тормозным краном.
+    const lampShade = new THREE.Mesh(
+      new THREE.ConeGeometry(0.14, 0.16, 12, 1, true),
+      new THREE.MeshStandardMaterial({ color: 0x2b2b26, roughness: 0.8, metalness: 0.4, side: THREE.DoubleSide }),
+    );
+    lampShade.position.set(0.85, 2.35, -15.05);
+    group.add(lampShade);
+    const bulb = new THREE.Mesh(
+      new THREE.SphereGeometry(0.06, 10, 8),
+      new THREE.MeshStandardMaterial({ color: 0xff6a3d, emissive: 0xff3a10, emissiveIntensity: 2.4 }),
+    );
+    bulb.position.set(0.85, 2.26, -15.05);
+    group.add(bulb);
+    const lamp = new THREE.PointLight(0xff5a2a, 2.4, 6.5, 2);
+    lamp.position.set(0.85, 2.2, -15.0);
+    group.add(lamp);
+
+    group.visible = false;
+    if (this.renderer) this.renderer.shadowMap.needsUpdate = true;
+    this._serviceProps = group;
   }
 }
 
@@ -5570,46 +5726,220 @@ class RemotePlayers {
     }
   }
 
+  /** Детерминированный «характер» члена экипажа по id: цвет, рост, шапка. */
+  static _crewLook(id, name) {
+    const seed = String(`${id}|${name || ''}`);
+    let hash = 2166136261;
+    for (let i = 0; i < seed.length; i += 1) {
+      hash ^= seed.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    const looks = [
+      { coat: 0x3b4a44, trim: 0x1f2a26, skin: 0xc9ad8f, hat: 'cap', scarf: 0x6d2f28, gear: 'lantern' },
+      { coat: 0x4a3f34, trim: 0x2b241b, skin: 0x8d6a4c, hat: 'beanie', scarf: 0x5a6b52, gear: 'satchel' },
+      { coat: 0x2f3d4d, trim: 0x1c2531, skin: 0xd8bd9d, hat: 'hood', scarf: 0x8b6b3a, gear: 'radio' },
+      { coat: 0x4a3540, trim: 0x2a1e26, skin: 0xb08a68, hat: 'none', scarf: 0x77604a, gear: 'lantern' },
+      { coat: 0x37472f, trim: 0x212c1c, skin: 0x9b7355, hat: 'cap', scarf: 0xa0632f, gear: 'satchel' },
+      { coat: 0x3c3c46, trim: 0x23232b, skin: 0xe0c8ab, hat: 'beanie', scarf: 0x6a4a5a, gear: 'radio' },
+    ];
+    const look = looks[hash % looks.length];
+    return {
+      ...look,
+      height: 0.94 + ((hash >>> 8) % 13) / 100,
+      build: 0.9 + ((hash >>> 16) % 21) / 100,
+    };
+  }
+
   _createAvatar(player) {
     const group = new THREE.Group();
     group.name = `Пассажир: ${player.name}`;
     group.visible = false;
     this._group.add(group);
 
-    const bodyMaterial = new THREE.MeshStandardMaterial({
-      color: 0x3a4640,
-      roughness: 0.88,
-      metalness: 0.08,
+    const look = RemotePlayers._crewLook(player.id, player.name);
+    const scale = look.height;
+    group.scale.setScalar(scale);
+
+    const coatMaterial = new THREE.MeshStandardMaterial({
+      color: look.coat,
+      roughness: 0.92,
+      metalness: 0.05,
       emissive: 0x18251c,
-      emissiveIntensity: 0.85,
+      emissiveIntensity: 0.5,
     });
-    const body = new THREE.Mesh(this._bodyGeometry, bodyMaterial);
-    body.position.y = 0.79;
-    body.castShadow = false;
-    body.receiveShadow = false;
+    const trimMaterial = new THREE.MeshStandardMaterial({ color: look.trim, roughness: 0.85, metalness: 0.15 });
+    const skinMaterial = new THREE.MeshStandardMaterial({ color: look.skin, roughness: 0.72 });
+    const scarfMaterial = new THREE.MeshStandardMaterial({ color: look.scarf, roughness: 0.95 });
+    const darkMaterial = new THREE.MeshStandardMaterial({ color: 0x1b1c19, roughness: 0.86 });
+    const gearMaterial = new THREE.MeshStandardMaterial({
+      color: 0x2c2a22,
+      roughness: 0.7,
+      metalness: 0.45,
+    });
+
+    const body = new THREE.Group();
+    body.position.y = 0.82;
     group.add(body);
 
-    const head = new THREE.Mesh(this._headGeometry, bodyMaterial);
-    head.position.y = 1.66;
-    group.add(head);
+    // Пальто: сужается к поясу, полы расходятся.
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.25 * look.build, 0.5, 4, 12), coatMaterial);
+    torso.scale.set(1.1, 1, 0.78);
+    torso.position.y = 0.16;
+    body.add(torso);
 
-    const shoulders = new THREE.Mesh(
-      this._shoulderGeometry,
-      new THREE.MeshStandardMaterial({ color: 0x232a25, roughness: 0.8, metalness: 0.2 }),
+    const collar = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.05, 8, 16), scarfMaterial);
+    collar.rotation.x = Math.PI / 2;
+    collar.position.y = 0.44;
+    body.add(collar);
+
+    const coatTails = new THREE.Mesh(new THREE.BoxGeometry(0.44 * look.build, 0.34, 0.2), coatMaterial);
+    coatTails.position.set(0, -0.28, -0.12);
+    coatTails.rotation.x = -0.08;
+    body.add(coatTails);
+
+    // Ремень и бляха.
+    const belt = new THREE.Mesh(new THREE.BoxGeometry(0.46 * look.build, 0.05, 0.3), darkMaterial);
+    belt.position.y = -0.1;
+    body.add(belt);
+    const buckle = new THREE.Mesh(
+      new THREE.BoxGeometry(0.06, 0.045, 0.02),
+      new THREE.MeshStandardMaterial({ color: 0x8a7a48, roughness: 0.4, metalness: 0.8 }),
     );
-    shoulders.position.y = 1.35;
-    group.add(shoulders);
+    buckle.position.set(0, -0.1, 0.155);
+    body.add(buckle);
 
-    // Светящаяся полоска визора — силуэт читается в темноте.
+    // Руки — вдоль тела, с манжетами.
+    for (const side of [-1, 1]) {
+      const shoulder = new THREE.Group();
+      shoulder.position.set(side * 0.28 * look.build, 0.3, 0);
+      body.add(shoulder);
+      const upper = new THREE.Mesh(new THREE.CapsuleGeometry(0.062, 0.24, 3, 8), coatMaterial);
+      upper.position.y = -0.14;
+      shoulder.add(upper);
+      const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.072, 0.072, 0.05, 10), trimMaterial);
+      cuff.position.y = -0.28;
+      shoulder.add(cuff);
+      const hand = new THREE.Mesh(new THREE.SphereGeometry(0.055, 9, 7), skinMaterial);
+      hand.position.y = -0.33;
+      shoulder.add(hand);
+      shoulder.rotation.z = side * -0.08;
+    }
+
+    // Ноги и ботинки.
+    for (const side of [-1, 1]) {
+      const leg = new THREE.Group();
+      leg.position.set(side * 0.11, 0.62, 0);
+      group.add(leg);
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.5, 3, 8), darkMaterial);
+      thigh.position.y = -0.28;
+      leg.add(thigh);
+      const boot = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.09, 0.24), gearMaterial);
+      boot.position.set(0, -0.58, 0.04);
+      leg.add(boot);
+    }
+
+    // Голова и лицо.
+    const head = new THREE.Group();
+    head.position.y = 0.6;
+    body.add(head);
+    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.135, 16, 12), skinMaterial);
+    skull.scale.set(0.94, 1.05, 1);
+    head.add(skull);
+    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.028, 0.07, 6), skinMaterial);
+    nose.rotation.x = Math.PI / 2;
+    nose.position.set(0, -0.01, 0.13);
+    head.add(nose);
+
+    // Глаза светятся слабо — в темноте видно, что это человек, а не капсула.
+    const eyeMaterial = new THREE.MeshStandardMaterial({
+      color: 0x1a1a14,
+      emissive: 0xd8c88a,
+      emissiveIntensity: 0.45,
+      roughness: 0.3,
+    });
+    for (const side of [-1, 1]) {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.022, 8, 6), eyeMaterial);
+      eye.position.set(side * 0.05, 0.025, 0.122);
+      head.add(eye);
+    }
+
+    // Шапка: вариантов четыре, чтобы экипаж не выглядел близнецами.
+    if (look.hat === 'cap') {
+      const crown = new THREE.Mesh(new THREE.CylinderGeometry(0.142, 0.142, 0.08, 14), trimMaterial);
+      crown.position.y = 0.1;
+      head.add(crown);
+      const brim = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.018, 0.16), darkMaterial);
+      brim.position.set(0, 0.07, 0.12);
+      head.add(brim);
+    } else if (look.hat === 'beanie') {
+      const cap = new THREE.Mesh(new THREE.SphereGeometry(0.145, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.55), scarfMaterial);
+      cap.position.y = 0.055;
+      head.add(cap);
+      const fold = new THREE.Mesh(new THREE.TorusGeometry(0.138, 0.022, 8, 18), scarfMaterial);
+      fold.rotation.x = Math.PI / 2;
+      fold.position.y = 0.06;
+      head.add(fold);
+    } else if (look.hat === 'hood') {
+      const hood = new THREE.Mesh(
+        new THREE.SphereGeometry(0.19, 14, 12, 0, Math.PI * 2, 0, Math.PI * 0.62),
+        coatMaterial,
+      );
+      hood.position.set(0, 0.04, -0.03);
+      hood.rotation.x = -0.18;
+      head.add(hood);
+    } else {
+      const hair = new THREE.Mesh(
+        new THREE.SphereGeometry(0.14, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.5),
+        darkMaterial,
+      );
+      hair.position.y = 0.045;
+      head.add(hair);
+    }
+
+    // Снаряжение: фонарь, сумка или рация.
+    if (look.gear === 'lantern') {
+      const lantern = new THREE.Group();
+      lantern.position.set(0.24 * look.build, -0.16, 0.1);
+      body.add(lantern);
+      const housing = new THREE.Mesh(new THREE.CylinderGeometry(0.042, 0.05, 0.11, 10), gearMaterial);
+      lantern.add(housing);
+      const bulb = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.036, 0.036, 0.055, 10),
+        new THREE.MeshStandardMaterial({ color: 0xffe1a0, emissive: 0xffc169, emissiveIntensity: 2.2 }),
+      );
+      lantern.add(bulb);
+    } else if (look.gear === 'satchel') {
+      const strap = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.5, 0.02), darkMaterial);
+      strap.position.set(-0.12, 0.16, 0.155);
+      strap.rotation.z = 0.42;
+      body.add(strap);
+      const bag = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.18, 0.1), gearMaterial);
+      bag.position.set(0.16, -0.16, 0.13);
+      bag.rotation.z = -0.06;
+      body.add(bag);
+    } else {
+      const radio = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.14, 0.05), gearMaterial);
+      radio.position.set(-0.19 * look.build, 0.16, 0.14);
+      body.add(radio);
+      const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.16, 5), gearMaterial);
+      antenna.position.set(-0.19 * look.build, 0.31, 0.14);
+      body.add(antenna);
+    }
+
+    // Нагрудный фонарик: по нему читается «кто говорит».
     const visorMaterial = new THREE.MeshStandardMaterial({
       color: 0x0a1410,
       emissive: 0x9be3dc,
       emissiveIntensity: 1.5,
       roughness: 0.4,
     });
-    const visor = new THREE.Mesh(this._visorGeometry, visorMaterial);
-    visor.position.set(0, 1.7, -0.15);
-    group.add(visor);
+    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.03, 0.02), visorMaterial);
+    visor.position.set(0, 0.26, 0.19);
+    body.add(visor);
+
+    body.traverse((object) => {
+      if (object.isMesh) object.castShadow = false;
+    });
 
     const ringMaterial = new THREE.MeshBasicMaterial({
       color: 0x9be3dc,
@@ -5634,7 +5964,7 @@ class RemotePlayers {
     });
     const tag = new THREE.Sprite(tagMaterial);
     tag.scale.set(1.5, 0.42, 1);
-    tag.position.y = 2.18;
+    tag.position.y = 2.18 * scale;
     group.add(tag);
 
     const avatar = {
@@ -5643,7 +5973,7 @@ class RemotePlayers {
       name: player.name,
       group,
       body,
-      bodyMaterial,
+      bodyMaterial: coatMaterial,
       visor,
       visorMaterial,
       ring,
@@ -5656,6 +5986,7 @@ class RemotePlayers {
       inCar: false,
       lastTagState: '',
       hasState: false,
+      look,
     };
 
     if (this.voice) this.voice.attachAvatar(player.id, group);
@@ -5885,8 +6216,9 @@ class RemotePlayers {
         avatar.tagMaterial.opacity = clamp((CONFIG.voice.nametagDistance - distance) / 5, 0.12, 1);
       }
 
-      // Лёгкое «дыхание» капсулы.
-      avatar.body.position.y = 0.79 + (speaking ? Math.sin(elapsed * 6) * 0.006 : 0);
+      // Лёгкое «дыхание»: плечи поднимаются, когда пассажир говорит.
+      const baseY = 0.82 * (avatar.look ? avatar.look.height : 1);
+      avatar.body.position.y = baseY + (speaking ? Math.sin(elapsed * 6) * 0.008 : 0);
     }
   }
 
@@ -5938,6 +6270,7 @@ class VoiceChat {
     this._lastLocalLevel = 0;
     this._retryTimers = new Map();
     this._noiseBuffer = null;
+    this.echoGuard = this.store.values.echoGuard !== false;
     this._pttBound = false;
     this._lastRoster = null;
     this._micRetryTimer = 0;
@@ -6192,7 +6525,10 @@ class VoiceChat {
   }
 
   _getOutgoingStream() {
-    if (this.localStream) return this.outgoingStream || this.localStream;
+    if (this.localStream) {
+      this._buildOutgoing();
+      return this.outgoingStream || this.localStream;
+    }
     if (!this.silentStream) {
       const ctx = this.listener ? this.listener.context : this.audio.ctx;
       if (!ctx) return null;
@@ -6259,7 +6595,12 @@ class VoiceChat {
     if (this.network.usesRelay) {
       // Trystero добавляет микрофон в общий канал; отдельный «звонок»
       // не нужен, входящий поток приходит в attachRemoteStream().
-      if (this.localStream) this.network.publishVoiceStream(this.localStream);
+      // Наружу — только поток с гейтом: иначе рация и «голос выключен»
+      // всё равно передавали бы сырой микрофон.
+      if (this.localStream) {
+        this._buildOutgoing();
+        this.network.publishVoiceStream(this.outgoingStream || this.localStream);
+      }
       return;
     }
 
@@ -6503,11 +6844,28 @@ class VoiceChat {
     presence.type = 'peaking';
     presence.frequency.value = 1750;
     presence.Q.value = 1.1;
-    presence.gain.value = 5;
+    presence.gain.value = 2;
 
-    const shaper = ctx.createWaveShaper();
-    shaper.curve = this._makeDistortionCurve(12);
-    shaper.oversample = '2x';
+    // Грит убран: нелинейность после среза частот рождала гармоники выше
+    // 3.4 кГц, и тихий шум чужого микрофона превращался в «писк».
+    // Характер рации дают фильтры, а не перегрузка.
+    const postLowpass = ctx.createBiquadFilter();
+    postLowpass.type = 'lowpass';
+    postLowpass.frequency.value = 2900;
+    postLowpass.Q.value = 0.5;
+
+    const hissShelf = ctx.createBiquadFilter();
+    hissShelf.type = 'highshelf';
+    hissShelf.frequency.value = 2600;
+    hissShelf.gain.value = -9;
+
+    // Лимитер — страховка от «воя» и перегруза, когда два игрока на динамиках.
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -18;
+    limiter.knee.value = 8;
+    limiter.ratio.value = 14;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.18;
 
     const voiceGain = ctx.createGain();
     voiceGain.gain.value = CONFIG.voice.radioGain;
@@ -6519,17 +6877,22 @@ class VoiceChat {
     source.connect(highpass);
     highpass.connect(lowpass);
     lowpass.connect(presence);
-    presence.connect(shaper);
-    shaper.connect(voiceGain);
+    presence.connect(postLowpass);
+    postLowpass.connect(hissShelf);
+    hissShelf.connect(voiceGain);
+    voiceGain.connect(limiter);
     voiceGain.connect(analyser);
 
+    // Один-единственный путь: limiter → PositionalAudio → listener.
+    // Раньше gain подключался ещё и напрямую к panner/listener, из-за чего
+    // голос шёл двойным трактом и мог «заводиться» в петлю.
     const audio = new THREE.PositionalAudio(this.listener);
     audio.setDistanceModel('inverse');
     audio.setRefDistance(CONFIG.voice.refDistance);
     audio.setRolloffFactor(CONFIG.voice.rolloff);
     audio.setMaxDistance(CONFIG.voice.maxDistance);
     audio.setVolume(1);
-    audio.setNodeSource(voiceGain);
+    audio.setNodeSource(limiter);
 
     entry.object3D.add(audio);
 
@@ -6554,8 +6917,9 @@ class VoiceChat {
 
     entry.audio = audio;
     entry.gain = voiceGain;
+    entry.limiter = limiter;
     entry.source = source;
-    entry.nodes = [highpass, lowpass, presence, shaper, voiceGain];
+    entry.nodes = [highpass, lowpass, presence, postLowpass, hissShelf, voiceGain, limiter];
     entry.staticNodes = [staticSource, staticFilter, staticGain];
     entry.staticGain = staticGain;
     entry.analyser = analyser;
@@ -6577,34 +6941,33 @@ class VoiceChat {
     return curve;
   }
 
+  /**
+   * Переключает только параметры затухания. Никаких дополнительных
+   * соединений: цепочка собрана один раз в _buildAudio, поэтому звук
+   * не может пойти по двум трактам и «завестись».
+   */
   _applyRouting(entry) {
-    if (!entry.gain) return;
-    const ctx = this.listener.context;
+    if (!entry.audio) return;
     const flat = !this.enabled || !this.localInCar || !entry.inCar;
-
     if (entry.flat === flat) return;
     entry.flat = flat;
-
     try {
-      entry.gain.disconnect();
+      if (flat) {
+        // Вне салона голос слышен как рация: без затухания по расстоянию.
+        entry.audio.setDistanceModel('linear');
+        entry.audio.setRefDistance(1);
+        entry.audio.setRolloffFactor(0);
+        entry.audio.setMaxDistance(1000);
+      } else {
+        entry.audio.setDistanceModel('inverse');
+        entry.audio.setRefDistance(CONFIG.voice.refDistance);
+        entry.audio.setRolloffFactor(CONFIG.voice.rolloff);
+        entry.audio.setMaxDistance(CONFIG.voice.maxDistance);
+      }
     } catch (error) {
       /* ignore */
     }
-
-    if (flat) {
-      entry.gain.connect(this.listener.getInput());
-      if (entry.audio) entry.audio.setVolume(1);
-    } else if (entry.audio) {
-      entry.gain.connect(entry.audio.getOutput());
-    }
-
-    // Возобновляем цепочку после переподключения узлов.
-    try {
-      entry.source && entry.source.disconnect();
-      entry.source.connect(entry.nodes[0]);
-    } catch (error) {
-      /* ignore */
-    }
+    entry.volume = null;
   }
 
   _teardownAudio(entry) {
@@ -6744,6 +7107,7 @@ class VoiceChat {
 
     // Удалённые игроки: пики, шум эфира, маршрутизация.
     for (const entry of this.peers.values()) {
+      if (entry.analyser) this._checkHowl(entry, dt);
       if (entry.analyser && entry.analyserData) {
         entry.analyser.getByteTimeDomainData(entry.analyserData);
         let sum = 0;
@@ -6756,7 +7120,7 @@ class VoiceChat {
         entry.level += (target - entry.level) * 0.35;
         entry.speaking = entry.level > 0.12;
         if (entry.staticGain) {
-          const staticLevel = entry.speaking ? 0.006 + entry.level * 0.016 : 0.0006;
+          const staticLevel = entry.speaking ? 0.0015 + entry.level * 0.004 : 0.00012;
           entry.staticGain.gain.setTargetAtTime(staticLevel, this.listener.context.currentTime, 0.08);
         }
       }
@@ -6764,23 +7128,93 @@ class VoiceChat {
       if (entry.audio) {
         const flat = !this.enabled || !this.localInCar || !entry.inCar;
         if (entry.flat !== flat) this._applyRouting(entry);
-        if (!flat && entry.object3D) {
-          const distance = this.camera.position.distanceTo(entry.object3D.position);
-          const fade = 1 - clamp(
-            (distance - CONFIG.voice.fadeStart) / (CONFIG.voice.fadeEnd - CONFIG.voice.fadeStart),
-            0,
-            1,
-          );
-          const volume = fade * fade * (this.enabled ? 1 : 0);
-          if (Math.abs(volume - (entry.volume ?? -1)) > 0.01) {
-            entry.volume = volume;
-            entry.audio.setVolume(volume);
+        let volume = 0;
+        if (this.enabled) {
+          if (flat) {
+            volume = 1;
+          } else if (entry.object3D) {
+            const distance = this.camera.position.distanceTo(entry.object3D.position);
+            const fade = 1 - clamp(
+              (distance - CONFIG.voice.fadeStart) / (CONFIG.voice.fadeEnd - CONFIG.voice.fadeStart),
+              0,
+              1,
+            );
+            volume = fade * fade;
           }
+          // Эхо-защита: когда локальный микрофон слышит громкий звук
+          // (скорее всего — собственные динамики), приглушаем чужой голос.
+          // Это рвёт акустическую петлю, из-за которой возникает «писк».
+          if (this.echoGuard) {
+            const hot = clamp((this.localLevel - 0.2) / 0.3, 0, 1);
+            volume *= 1 - hot * 0.9;
+          }
+        }
+        if (entry.duck) volume *= 1 - entry.duck * 0.82;
+        if (Math.abs(volume - (entry.volume ?? -1)) > 0.01) {
+          entry.volume = volume;
+          entry.audio.setVolume(volume);
         }
       }
     }
 
     this._emitStatus(false);
+  }
+
+  /**
+   * Защита от «писка»: узкий устойчивый тон в высоких частотах — это
+   * акустическая петля на стороне другого игрока, а не голос.
+   * Приглушаем такой канал, пока тон не исчезнет.
+   */
+  _checkHowl(entry, dt) {
+    const analyser = entry.analyser;
+    if (!analyser) return;
+    if (!entry.spectrum || entry.spectrum.length !== analyser.frequencyBinCount) {
+      entry.spectrum = new Uint8Array(analyser.frequencyBinCount);
+      entry.howlFrames = 0;
+      entry.howlBin = 0;
+      entry.duck = 0;
+    }
+    const bins = entry.spectrum;
+    analyser.getByteFrequencyData(bins);
+    const binHz = this.listener.context.sampleRate / analyser.fftSize;
+    let peak = 0;
+    let peakBin = 0;
+    let total = 0;
+    let counted = 0;
+    for (let i = 3; i < bins.length; i += 1) {
+      const value = bins[i];
+      total += value;
+      counted += 1;
+      if (value > peak) {
+        peak = value;
+        peakBin = i;
+      }
+    }
+    const hz = peakBin * binHz;
+    const average = counted ? total / counted : 0;
+    const tone = peak > 148 && peak > average * 3.4 && hz > 900 && hz < 4200;
+
+    if (tone) {
+      if (entry.howlBin && Math.abs(peakBin - entry.howlBin) <= 2) entry.howlFrames = (entry.howlFrames || 0) + 1;
+      else {
+        entry.howlBin = peakBin;
+        entry.howlFrames = 1;
+      }
+    } else if (entry.howlFrames > 0) {
+      entry.howlFrames -= 1;
+      if (entry.howlFrames === 0) entry.howlBin = 0;
+    }
+
+    if ((entry.howlFrames || 0) > 9) {
+      entry.duck = 1;
+      if (!entry.howlWarned) {
+        entry.howlWarned = true;
+        this.bus.emit('voice:howl', { id: entry.id, hz: Math.round(hz) });
+      }
+    } else if (entry.duck) {
+      entry.duck = Math.max(0, entry.duck - dt * 0.55);
+      if (entry.duck === 0) entry.howlWarned = false;
+    }
   }
 
   /** Микрофон отобрали в системе — восстанавливаем канал без перезапуска игры. */
@@ -6927,6 +7361,14 @@ class PassengerNPC {
 
     // Пальто / торс.
     this._add(new THREE.BoxGeometry(0.43, 0.63, 0.3), coat, this.body, 0, 0.33, 0);
+    // Полы пальто — фигура перестаёт быть «коробкой».
+    const tail = this._add(new THREE.BoxGeometry(0.44, 0.34, 0.06), coatDark, this.body, 0, -0.03, -0.14);
+    tail.rotation.x = -0.14;
+    // Нагрудный карман и пуговицы.
+    this._add(new THREE.BoxGeometry(0.12, 0.06, 0.02), coatDark, this.body, -0.09, 0.42, 0.153);
+    for (let i = 0; i < 3; i += 1) {
+      this._add(new THREE.SphereGeometry(0.015, 7, 5), leather, this.body, 0.05, 0.18 + i * 0.12, 0.156);
+    }
     // Борт пальто и воротник.
     this._add(new THREE.BoxGeometry(0.08, 0.5, 0.02), coatDark, this.body, 0, 0.31, 0.155);
     this._add(new THREE.BoxGeometry(0.3, 0.08, 0.26), coatDark, this.body, 0, 0.625, 0);
@@ -6949,6 +7391,16 @@ class PassengerNPC {
     // Волосы/кепка.
     this._add(new THREE.SphereGeometry(0.14, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2), hair, this.head, 0, 0.235, -0.01);
     this._add(new THREE.CylinderGeometry(0.155, 0.155, 0.022, 16), hair, this.head, 0, 0.3, 0.01);
+    // Кокарда проводника.
+    this._add(
+      new THREE.CylinderGeometry(0.026, 0.026, 0.01, 10),
+      this._material(0x8a7a48, { roughness: 0.35, metalness: 0.85, weight: 0.6, glow: 0.3 }),
+      this.head,
+      0,
+      0.312,
+      0.11,
+      Math.PI / 2,
+    );
 
     // Глаза: в обычной личине погашены, после пробуждения — красные.
     this.eyeMaterial = new THREE.MeshStandardMaterial({
@@ -6970,7 +7422,24 @@ class PassengerNPC {
       elbow.position.set(0, -0.3, 0);
       shoulder.add(elbow);
       this._add(new THREE.CapsuleGeometry(0.048, 0.2, 3, 8), coatDark, elbow, 0, -0.14, 0);
-      this._add(new THREE.SphereGeometry(0.055, 10, 8), porcelain, elbow, 0, -0.29, 0.01);
+      this._add(new THREE.CylinderGeometry(0.05, 0.054, 0.04, 10), coatDark, elbow, 0, -0.245, 0.005);
+      const palm = this._add(new THREE.SphereGeometry(0.052, 12, 9), porcelain, elbow, 0, -0.29, 0.012);
+      palm.scale.set(1, 0.78, 1.15);
+      // Шесть пальцев: главная деталь, по которой его узнают.
+      for (let finger = 0; finger < 6; finger += 1) {
+        const spread = (finger - 2.5) * 0.019;
+        this._add(
+          new THREE.CapsuleGeometry(0.0085, 0.055, 2, 5),
+          porcelain,
+          elbow,
+          spread,
+          -0.325,
+          0.038,
+          0.5,
+          0,
+          spread * 1.6,
+        );
+      }
       return { shoulder, elbow };
     };
     const left = buildArm(-1);
@@ -7034,6 +7503,16 @@ class PassengerNPC {
     this.aura = new THREE.PointLight(0xff2a12, 0, 4.6, 2);
     this.aura.position.set(0, 1.15, 0);
     this.root.add(this.aura);
+
+    // Единый объём для захвата и проверки билета: тонкие детали модели
+    // оставляют зазоры, из-за которых луч проходит мимо.
+    const grabBox = new THREE.Mesh(
+      new THREE.BoxGeometry(0.72, 1.55, 0.66),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
+    );
+    grabBox.position.set(0, 0.82, 0.06);
+    this.root.add(grabBox);
+    this.hitMeshes.push(grabBox);
   }
 
   // ---------------------------------------------------------------------------
@@ -7525,12 +8004,23 @@ class DemonDirector {
     this._huntTime = 0;
     this._stateClock = 0;
     this._draggingId = null;
+    this._dragHelpers = new Set();
     this._dragStartedAt = 0;
     this._deadIds = new Set();
     this._killed = false;
     this._guestHuntAnnounced = false;
     this._selfPos = new THREE.Vector3();
     this._euler = new THREE.Euler();
+
+    // Вагоны: 0 — пассажирский, 1 — служебный. Координаты общие, различается
+    // только видимость и то, кто в каком вагоне находится.
+    this.carIndex = 0;
+    this.localCar = 0;
+    this._transferTimer = 0;
+    this._escaping = false;
+    this._stuckTime = 0;
+    this._lastHuntPos = { x: 0, z: 0 };
+    this._escapeSent = false;
 
     this.bus.on('player:interact', (payload) => this._onInteract(payload));
     this.bus.on('demon:heard', (payload) => this._onHeard(payload));
@@ -7546,45 +8036,79 @@ class DemonDirector {
     this.npc.reset();
     this.active = true;
     this.phase = DEMON_PHASE.INCOGNITO;
+    this.carIndex = 0;
+    this.localCar = 0;
     this._wakeTimer = 0;
     this._stunTimer = 0;
     this._huntTime = 0;
     this._stateClock = 0;
     this._draggingId = null;
+    this._dragHelpers.clear();
     this._deadIds.clear();
     this._killed = false;
     this._guestHuntAnnounced = false;
     this._rayTarget = null;
     this._npcDistance = Infinity;
+    this._transferTimer = 0;
+    this._escaping = false;
+    this._stuckTime = 0;
+    this._escapeSent = false;
     this.player.setSpeedScale(1);
     this.world.setBlackout(false);
     this.ui.setScare(false);
-    this.ui.hidePrompt();
+    this.ui.hidePrompt(999);
+    this._syncVisibility();
   }
 
   reset() {
     this.active = false;
     this.phase = DEMON_PHASE.IDLE;
+    this.carIndex = 0;
+    this.localCar = 0;
     this._draggingId = null;
+    this._dragHelpers.clear();
     this._deadIds.clear();
     this._killed = false;
     this._rayTarget = null;
     this._npcDistance = Infinity;
     this._wakeTimer = 0;
     this._stunTimer = 0;
+    this._transferTimer = 0;
+    this._escaping = false;
+    this._stuckTime = 0;
+    this._escapeSent = false;
     this.player.setSpeedScale(1);
     this.world.setBlackout(false);
     this.ui.setScare(false);
-    this.ui.hidePrompt();
+    this.ui.hidePrompt(999);
     this.npc.reset();
+    this._syncVisibility();
+  }
+
+  /** Локальный вагон игрока: демон виден только в своём. */
+  setLocalCar(index) {
+    const next = index === 1 ? 1 : 0;
+    if (this.localCar === next) return;
+    this.localCar = next;
+    this._syncVisibility();
+    this._rayTarget = null;
+    this.npc.setHighlight(false);
+    this.ui.hidePrompt(20);
+  }
+
+  _syncVisibility() {
+    if (!this.npc || !this.npc.root) return;
+    // В меню carIndex и localCar совпадают, в игре — виден только в своём вагоне.
+    const visible = this.carIndex === this.localCar;
+    this.npc.root.visible = visible;
   }
 
   /** Пауза: отпускаем тело, чтобы замедление не «залипло» после возврата. */
   pause() {
-    this._endDrag({ silent: true });
+    this._endDrag({ silent: true, all: true });
     this._rayTarget = null;
     this.npc.setHighlight(false);
-    this.ui.hidePrompt();
+    this.ui.hidePrompt(999);
   }
 
   // ---------------------------------------------------------------------------
@@ -7602,6 +8126,14 @@ class DemonDirector {
     this.ui.showToast('СИГНАЛ УШЁЛ В ВАГОН…', 'warning', 1200);
   }
 
+  /** Проверка билета: пассажир оказывается без билета. */
+  wakeFromTicket() {
+    if (!this.active || this.phase !== DEMON_PHASE.INCOGNITO) return false;
+    if (this._isHost()) return this._beginReveal('ticket', true);
+    this.network.sendDemon({ kind: 'wake', source: 'ticket', stun: true });
+    return true;
+  }
+
   _beginReveal(source, stun) {
     if (this.phase !== DEMON_PHASE.INCOGNITO) return false;
     this.network.sendDemon({ kind: 'wake', source, stun: Boolean(stun) });
@@ -7616,15 +8148,17 @@ class DemonDirector {
     this._wakeTimer = stun ? 0 : CONFIG.demon.wakeDelay;
     this._killed = false;
     this._guestHuntAnnounced = false;
+    this._transferTimer = 0;
 
     // Маска слетает мгновенно: кровь, глаза, свечение.
     this.npc.setBlood(1);
     this.npc.setPose(stun ? 'ragdoll' : 'waking');
     this.npc.setHighlight(false);
-    this.ui.hidePrompt();
+    this.ui.hidePrompt(999);
     this.ui.setScare(true);
     this.world.setBlackout(true);
     this.audio.screech();
+    this._syncVisibility();
 
     const target = this._closestPlayer();
     if (target) {
@@ -7635,11 +8169,14 @@ class DemonDirector {
 
     const message = source === 'scream'
       ? 'КРИК РАЗБУДИЛ ЕГО // СВЕТ ПОГАС'
-      : source === 'grab'
-        ? 'ВЫ ПРИКОСНУЛИСЬ К НЕМУ // СВЕТ ПОГАС'
-        : 'ОН УСЛЫШАЛ ВАС // СВЕТ ПОГАС';
+      : source === 'ticket'
+        ? 'БИЛЕТА НЕТ // ОН СМОТРИТ НА ВАС'
+        : source === 'grab'
+          ? 'ВЫ ПРИКОСНУЛИСЬ К НЕМУ // СВЕТ ПОГАС'
+          : 'ОН УСЛЫШАЛ ВАС // СВЕТ ПОГАС';
     this.ui.showToast(message, 'error', 6200);
     this.bus.emit('demon:awakened', { source });
+    this.bus.emit('demon:phase', { phase: this.phase });
   }
 
   _startHunt() {
@@ -7648,13 +8185,43 @@ class DemonDirector {
     this._huntTime = 0;
     this._wakeTimer = 0;
     this._stunTimer = 0;
-    this._endDrag({ silent: true });
+    this._endDrag({ silent: true, all: true });
     this.npc.setPose('hunt');
-    this.ui.hidePrompt();
+    this.ui.hidePrompt(999);
+    this._escaping = Math.abs(this.npc.root.position.x) > 0.55;
+    this._stuckTime = 0;
+    this._lastHuntPos = {
+      x: this.npc.root.position.x,
+      z: this.npc.root.position.z,
+    };
     if (!this._guestHuntAnnounced) {
       this._guestHuntAnnounced = true;
       this.ui.showToast('ОН ВСТАЛ // БЕГИТЕ', 'error', 3600);
     }
+    this.bus.emit('demon:phase', { phase: this.phase });
+  }
+
+  /** Попытка аварийного торможения: победа для всего экипажа. */
+  requestEscape() {
+    if (this._escapeSent || this.phase === DEMON_PHASE.DEAD) return;
+    this._escapeSent = true;
+    if (this._isHost()) {
+      this.network.sendDemon({ kind: 'escape' });
+      this._finishEscape();
+    } else {
+      this.network.sendDemon({ kind: 'brake' });
+    }
+  }
+
+  _finishEscape() {
+    if (this.phase === DEMON_PHASE.DEAD) return;
+    this.phase = DEMON_PHASE.DEAD;
+    this._killed = true;
+    this.npc.setHighlight(false);
+    this.ui.hidePrompt(999);
+    this.ui.setScare(false);
+    this.world.setBlackout(false);
+    this.bus.emit('demon:escape', {});
   }
 
   // ---------------------------------------------------------------------------
@@ -7664,6 +8231,7 @@ class DemonDirector {
   update(dt, elapsed) {
     if (!this.active) return;
     this.npc.update(dt, elapsed);
+    this._syncVisibility();
 
     if (this.phase === DEMON_PHASE.WAKING) {
       this._wakeTimer -= dt;
@@ -7681,11 +8249,14 @@ class DemonDirector {
         this._rayTarget = null;
         this.npc.setHighlight(false);
       }
-      this.ui.hidePrompt();
+      this.ui.hidePrompt(20);
     }
 
     if (this.phase === DEMON_PHASE.STUNNED) this._updateDragging(dt);
-    if (this.phase === DEMON_PHASE.HUNTING && this._isHost()) this._updateHunt(dt);
+    if (this.phase === DEMON_PHASE.HUNTING && this._isHost()) {
+      this._updateCarTransfer(dt);
+      this._updateHunt(dt);
+    }
     if (this._isHost()) this._broadcastState(dt);
   }
 
@@ -7710,29 +8281,32 @@ class DemonDirector {
 
   _updatePrompt() {
     if (this.phase === DEMON_PHASE.STUNNED) {
-      // Тело уже на полу: смотреть точно в него не нужно, достаточно близости.
-      if (this._draggingId && this._draggingId === this._selfId()) {
-        this.ui.showPrompt('ОТПУСТИТЕ E — БРОСИТЬ ТЕЛО', 'E', 'danger');
-      } else if (this._npcDistance <= CONFIG.npc.grabDistance + 0.5) {
-        this.ui.showPrompt('УДЕРЖИВАЙТЕ E — ТАЩИТЬ ТЕЛО', 'E', 'danger');
+      const selfId = this._selfId();
+      if (this._draggingId === selfId) {
+        const help = this._dragHelpers.size ? ' // ВДВОЁМ БЫСТРЕЕ' : '';
+        this.ui.showPrompt(`ОТПУСТИТЕ E — БРОСИТЬ ТЕЛО${help}`, 'E', 'danger', 20);
+      } else if (this._draggingId && this._npcDistance <= CONFIG.npc.grabDistance + 0.8) {
+        this.ui.showPrompt('УДЕРЖИВАЙТЕ E — ПОМОЧЬ НЕСТИ', 'E', 'normal', 20);
+      } else if (!this._draggingId && this._npcDistance <= CONFIG.npc.grabDistance + 0.5) {
+        this.ui.showPrompt('УДЕРЖИВАЙТЕ E — ТАЩИТЬ ТЕЛО', 'E', 'danger', 20);
       } else {
-        this.ui.hidePrompt();
+        this.ui.hidePrompt(20);
       }
       return;
     }
     if (!this._rayTarget) {
-      this.ui.hidePrompt();
+      this.ui.hidePrompt(20);
       return;
     }
     if (this.phase === DEMON_PHASE.INCOGNITO) {
       if (this._npcDistance <= CONFIG.npc.grabDistance) {
-        this.ui.showPrompt('СХВАТИТЬ ПАССАЖИРА ЗА ПЛЕЧО', 'E', 'normal');
+        this.ui.showPrompt('ПРОВЕРИТЬ БИЛЕТ ПАССАЖИРА', 'E', 'normal', 20);
       } else {
-        this.ui.showPrompt('ПОДОЙДИТЕ БЛИЖЕ', '', 'normal');
+        this.ui.showPrompt('ПОДОЙДИТЕ БЛИЖЕ', '', 'normal', 20);
       }
       return;
     }
-    this.ui.hidePrompt();
+    this.ui.hidePrompt(20);
   }
 
   // ---------------------------------------------------------------------------
@@ -7744,53 +8318,108 @@ class DemonDirector {
     if (this.phase !== DEMON_PHASE.INCOGNITO && this.phase !== DEMON_PHASE.STUNNED) return;
 
     if (!held) {
-      if (this._draggingId === this._selfId()) this._endDrag();
+      if (this._draggingId === this._selfId() || this._dragHelpers.has(this._selfId())) {
+        this._endDrag();
+      }
       return;
     }
 
     if (this.phase === DEMON_PHASE.STUNNED) {
-      if (this._npcDistance <= CONFIG.npc.grabDistance + 0.5) this._beginDrag();
+      if (this._npcDistance <= CONFIG.npc.grabDistance + 0.8) this._beginDrag();
       return;
     }
 
     if (!this._rayTarget) return;
     if (this._npcDistance > CONFIG.npc.grabDistance) return;
     if (this._isHost()) {
-      this._beginReveal('grab', true);
+      this._beginReveal('ticket', true);
     } else {
-      this.network.sendDemon({ kind: 'grab' });
+      this.network.sendDemon({ kind: 'wake', source: 'ticket', stun: true });
+      this.ui.showToast('СИГНАЛ УШЁЛ В ВАГОН…', 'warning', 1200);
     }
   }
 
   _beginDrag() {
     if (this.phase !== DEMON_PHASE.STUNNED) return;
     const selfId = this._selfId();
-    if (this._draggingId && this._draggingId !== selfId) return;
-    this._draggingId = selfId;
-    this._dragStartedAt = performance.now();
-    this.player.setSpeedScale(CONFIG.npc.dragScale);
-    if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: true });
-    this.ui.showToast('ТЕЛО СЛУШАЕТСЯ // ВЫ ЕДВА ИДЁТЕ', 'warning', 2600);
-    this._stateClock = 0;
+    if (this._draggingId === selfId || this._dragHelpers.has(selfId)) return;
+
+    if (!this._draggingId) {
+      this._draggingId = selfId;
+      this._dragStartedAt = performance.now();
+      this._stateClock = 0;
+      this.ui.showToast('ТЕЛО СЛУШАЕТСЯ // ВЫ ЕДВА ИДЁТЕ', 'warning', 2600);
+      if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: true });
+    } else {
+      if (this._dragHelpers.size >= 1) return;
+      this._dragHelpers.add(selfId);
+      this._stateClock = 0;
+      this.ui.showToast('ВЫ ПОДХВАТИЛИ ТЕЛО // ТЕПЕРЬ ЛЕГЧЕ', 'warning', 2600);
+      if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: true, helper: true });
+    }
+    this._applyDragSpeed();
     this._updatePrompt();
   }
 
-  _endDrag({ silent = false } = {}) {
-    if (!this._draggingId) return;
+  _applyDragSpeed() {
     const selfId = this._selfId();
-    const wasLocal = this._draggingId === selfId;
-    this._draggingId = null;
+    let scale = 1;
+    if (this._draggingId === selfId) {
+      scale = this._dragHelpers.size > 0 ? CONFIG.npc.dragScaleTwo : CONFIG.npc.dragScale;
+    } else if (this._dragHelpers.has(selfId)) {
+      scale = CONFIG.npc.dragScaleHelper;
+    }
+    this.player.setSpeedScale(scale);
+    this.bus.emit('player:drag', { active: scale < 1, scale });
+  }
+
+  _endDrag({ silent = false, all = false } = {}) {
+    const selfId = this._selfId();
+    const wasOwner = this._draggingId === selfId;
+    const wasHelper = this._dragHelpers.has(selfId);
+    if (!this._draggingId && this._dragHelpers.size === 0) return;
+
+    if (all) {
+      this._draggingId = null;
+      this._dragHelpers.clear();
+      this.player.setSpeedScale(1);
+      if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: false });
+      return;
+    }
+
+    if (wasHelper) {
+      this._dragHelpers.delete(selfId);
+      if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: false, helper: true });
+      if (wasOwner) {
+        this._draggingId = null;
+        this._dragHelpers.clear();
+        if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: false });
+      }
+      this._applyDragSpeed();
+      if (!silent && wasHelper) this.ui.showToast('ВЫ ОТПУСТИЛИ ТЕЛО', 'warning', 1800);
+      this._updatePrompt();
+      return;
+    }
+
+    if (wasOwner) {
+      this._draggingId = null;
+      this._dragHelpers.clear();
+      this.player.setSpeedScale(1);
+      if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: false });
+      if (!silent) this.ui.showToast('ТЕЛО ОСТАЛОСЬ НА ПОЛУ', 'warning', 2200);
+      if (this.active && this.phase === DEMON_PHASE.STUNNED) this._updatePrompt();
+      return;
+    }
+
+    this._dragHelpers.clear();
     this.player.setSpeedScale(1);
-    if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: false });
-    if (wasLocal && !silent) this.ui.showToast('ТЕЛО ОСТАЛОСЬ НА ПОЛУ', 'warning', 2200);
-    if (this.active && this.phase === DEMON_PHASE.STUNNED) this._updatePrompt();
   }
 
   _updateDragging(dt) {
     if (!this._draggingId) return;
     const pose = this._playerPose(this._draggingId);
     if (!pose) {
-      this._endDrag({ silent: true });
+      this._endDrag({ silent: true, all: true });
       return;
     }
     this._placeBody(pose, dt);
@@ -7822,10 +8451,35 @@ class DemonDirector {
   // Охота (только хост)
   // ---------------------------------------------------------------------------
 
+  _updateCarTransfer(dt) {
+    if (this.phase !== DEMON_PHASE.HUNTING) return;
+    const players = this._allPlayers().filter((p) => !this._deadIds.has(p.id));
+    const same = players.filter((p) => (p.car ?? 0) === this.carIndex);
+    if (same.length || !players.length) {
+      this._transferTimer = 0;
+      return;
+    }
+    this._transferTimer += dt;
+    if (this._transferTimer < CONFIG.demon.transferDelay) return;
+    const target = this._closestPlayer();
+    if (!target) return;
+    this.carIndex = target.car ?? 0;
+    this._transferTimer = 0;
+    this._escaping = true;
+    this._stuckTime = 0;
+    this.npc.root.position.set(0, 0, -14.35);
+    this.npc.setYaw(Math.PI, true);
+    this._syncVisibility();
+    this._stateClock = 0;
+    this.ui.showToast('ДВЕРЬ ХЛОПНУЛА // ОН УЖЕ ЗДЕСЬ', 'error', 4200);
+    this.bus.emit('demon:changedCar', { car: this.carIndex });
+  }
+
   _updateHunt(dt) {
     this._huntTime += dt;
     const target = this._closestPlayer();
     if (!target) return;
+    if ((target.car ?? 0) !== this.carIndex) return;
 
     const npc = this.npc.root.position;
     const dx = target.x - npc.x;
@@ -7837,9 +8491,22 @@ class DemonDirector {
     }
 
     this.npc.setYaw(Math.atan2(dx, dz), false);
-    const ramp = clamp(0.5 + (this._huntTime / Math.max(0.01, CONFIG.demon.standTime)) * 0.5, 0.5, 1);
+    const ramp = clamp(0.55 + (this._huntTime / Math.max(0.01, CONFIG.demon.standTime)) * 0.45, 0.55, 1);
     const step = CONFIG.demon.huntSpeed * ramp * dt;
     this._advance(target, step);
+
+    const moved = Math.hypot(npc.x - this._lastHuntPos.x, npc.z - this._lastHuntPos.z);
+    this._lastHuntPos = { x: npc.x, z: npc.z };
+    if (moved < step * 0.15) {
+      this._stuckTime += dt;
+      if (this._stuckTime > 0.7) {
+        // Застрял в мебели — выбираемся к проходу, игнорируя коллизии.
+        this._escaping = true;
+        this._stuckTime = 0;
+      }
+    } else {
+      this._stuckTime = 0;
+    }
 
     const after = Math.hypot(target.x - npc.x, target.z - npc.z);
     if (after <= CONFIG.demon.killDistance) this._kill(target);
@@ -7847,33 +8514,33 @@ class DemonDirector {
 
   _advance(target, step) {
     const npc = this.npc.root.position;
-    const dx = target.x - npc.x;
-    const dz = target.z - npc.z;
-    let moveX = 0;
-    let moveZ = 0;
+    const aisle = CONFIG.demon.aisleX;
 
-    if (Math.abs(npc.x) > 1.02) {
-      // Тело поднимается из-за скамьи: коллизии игнорируем, пока оно
-      // не выйдет в проход, иначе демон навсегда застревает в мебели.
-      moveX = Math.sign(CONFIG.demon.aisleX - npc.x) || 1;
-      moveZ = Math.abs(dz) > 0.8 ? Math.sign(dz) * 0.4 : 0;
-    } else if (Math.abs(dz) > 0.85) {
-      moveX = Math.sign(CONFIG.demon.aisleX - npc.x) * 0.35;
-      moveZ = Math.sign(dz);
-    } else {
-      moveX = dx;
-      moveZ = dz;
-    }
-
-    const length = Math.hypot(moveX, moveZ) || 1;
-    const stepX = (moveX / length) * step;
-    const stepZ = (moveZ / length) * step;
-
-    if (Math.abs(npc.x) > 1.02) {
-      npc.x += stepX;
-      npc.z += stepZ;
+    // 1. Выход из-за скамьи. Тело стартует внутри мебели, поэтому здесь
+    //    коллизии намеренно игнорируются: иначе демон навсегда застревает
+    //    на краю сиденья и «стоит», пока игрок сам не подойдёт.
+    if (this._escaping || Math.abs(npc.x) > 0.9) {
+      this._escaping = true;
+      const dir = Math.sign(aisle - npc.x) || 1;
+      npc.x += dir * step * 0.9;
+      if (Math.abs(target.z - npc.z) > 1.2) {
+        npc.z += Math.sign(target.z - npc.z) * step * 0.3;
+      }
+      if (Math.abs(npc.x - aisle) <= 0.16) {
+        npc.x = aisle;
+        this._escaping = false;
+      }
       return;
     }
+
+    // 2. Погоня по проходу: целимся в игрока, при дальней дистанции
+    //    слегка прижимаемся к центру, чтобы не цеплять скамьи.
+    let dx = target.x - npc.x;
+    let dz = target.z - npc.z;
+    if (Math.abs(dz) > 3.2) dx = (aisle - npc.x) * 0.8 + dx * 0.2;
+    const length = Math.hypot(dx, dz) || 1;
+    const stepX = (dx / length) * step;
+    const stepZ = (dz / length) * step;
 
     const blocked = (x, z) => {
       const radius = CONFIG.demon.bodyRadius;
@@ -7899,17 +8566,22 @@ class DemonDirector {
       npc.z += stepZ;
       return;
     }
-    if (!blocked(npc.x + stepX, npc.z)) {
-      npc.x += stepX;
-      return;
+    // Скользим вдоль препятствия.
+    const slideZ = clamp(step * 0.7, 0.008, 0.2);
+    for (const sign of [Math.sign(dz) || 1, -(Math.sign(dz) || 1)]) {
+      if (!blocked(npc.x, npc.z + slideZ * sign)) {
+        npc.z += slideZ * sign;
+        return;
+      }
     }
-    if (!blocked(npc.x, npc.z + stepZ)) {
-      npc.z += stepZ;
-      return;
+    for (const sign of [Math.sign(dx) || 1, -(Math.sign(dx) || 1)]) {
+      if (!blocked(npc.x + slideZ * sign, npc.z)) {
+        npc.x += slideZ * sign;
+        return;
+      }
     }
-    // Обходим препятствие по кратчайшей стороне.
-    const nudge = Math.sign(CONFIG.demon.aisleX - npc.x) || 1;
-    if (!blocked(npc.x + nudge * 0.02, npc.z)) npc.x += nudge * 0.02;
+    // Совсем зажало — пробиваемся к центру прохода.
+    npc.x += Math.sign(aisle - npc.x || 1) * step * 0.5;
   }
 
   _kill(target) {
@@ -7918,11 +8590,12 @@ class DemonDirector {
     const name = target.name || 'ПАССАЖИР';
     this._deadIds.add(target.id);
     this.network.sendDemon({ kind: 'kill', target: target.id, name });
-    this._endDrag({ silent: true });
+    this._endDrag({ silent: true, all: true });
     this.phase = DEMON_PHASE.DEAD;
     this.npc.setPose('hunt');
     // Игра заканчивается для всего экипажа: это хоррор, а не аркада.
     this.onGameOver({ target: target.id, name });
+    this.bus.emit('demon:phase', { phase: this.phase });
   }
 
   // ---------------------------------------------------------------------------
@@ -7948,6 +8621,12 @@ class DemonDirector {
     return (entry && entry.name) || 'ПАССАЖИР';
   }
 
+  _carOf(id) {
+    if (id === this._selfId()) return this.localCar;
+    const entry = this.network.remoteStates && this.network.remoteStates.get(id);
+    return (entry && entry.s && Number(entry.s.car)) || 0;
+  }
+
   _playerPose(id) {
     if (id === this._selfId()) {
       return {
@@ -7955,6 +8634,7 @@ class DemonDirector {
         x: this.player.position.x,
         z: this.player.position.z,
         yaw: this._cameraYaw(),
+        car: this.localCar,
         name: this._nameOf(id),
       };
     }
@@ -7965,6 +8645,7 @@ class DemonDirector {
       x: Number(entry.s.x) || 0,
       z: Number(entry.s.z) || 0,
       yaw: Number(entry.s.yaw) || 0,
+      car: Number(entry.s.car) || 0,
       name: this._nameOf(id),
     };
   }
@@ -7975,6 +8656,7 @@ class DemonDirector {
       x: this.player.position.x,
       z: this.player.position.z,
       yaw: this._cameraYaw(),
+      car: this.localCar,
       name: this._nameOf(this._selfId()),
     }];
     if (!this.network.remoteStates) return list;
@@ -7987,6 +8669,7 @@ class DemonDirector {
         x: Number(entry.s.x) || 0,
         z: Number(entry.s.z) || 0,
         yaw: Number(entry.s.yaw) || 0,
+        car: Number(entry.s.car) || 0,
         name: this._nameOf(id),
       });
     }
@@ -8018,11 +8701,13 @@ class DemonDirector {
     this.network.sendDemon({
       kind: 'state',
       phase: this.phase,
+      car: this.carIndex,
       x: Number(position.x.toFixed(3)),
       z: Number(position.z.toFixed(3)),
       yaw: Number(this.npc.yaw.toFixed(3)),
       blood: Number(this.npc.blood.toFixed(2)),
       drag: this._draggingId || null,
+      helpers: Array.from(this._dragHelpers),
     });
   }
 
@@ -8033,6 +8718,7 @@ class DemonDirector {
     this.network.sendDemon({
       kind: 'sync',
       phase: this.phase,
+      car: this.carIndex,
       x: Number(position.x.toFixed(3)),
       z: Number(position.z.toFixed(3)),
       yaw: Number(this.npc.yaw.toFixed(3)),
@@ -8048,7 +8734,13 @@ class DemonDirector {
       } else if (data.kind === 'grab') {
         this._hostGuestGrab(data.from);
       } else if (data.kind === 'drag') {
-        this._hostGuestDrag(data.from, Boolean(data.active));
+        this._hostGuestDrag(data.from, Boolean(data.active), Boolean(data.helper));
+      } else if (data.kind === 'brake') {
+        this._finishEscape();
+        this.network.sendDemon({ kind: 'escape' });
+      } else if (data.kind === 'ticket') {
+        // Гость проверил билет — раздаём всем, чтобы счётчик совпадал.
+        this.network.sendDemon({ kind: 'ticket', index: data.index, from: data.from });
       }
       return;
     }
@@ -8059,6 +8751,14 @@ class DemonDirector {
     }
     if (data.kind === 'state' || data.kind === 'sync') {
       this._applyRemoteState(data);
+      return;
+    }
+    if (data.kind === 'ticket') {
+      this.bus.emit('ticket:remote', { index: data.index });
+      return;
+    }
+    if (data.kind === 'escape') {
+      this._finishEscape();
       return;
     }
     if (data.kind === 'kill') {
@@ -8087,17 +8787,25 @@ class DemonDirector {
     }
 
     const incoming = data.phase;
-    if (incoming !== DEMON_PHASE.STUNNED && this._draggingId) {
-      this._endDrag({ silent: true });
-    } else if (
-      this._draggingId
-      && this._draggingId !== data.drag
-      && performance.now() - (this._dragStartedAt || 0) > 700
-    ) {
-      // Хост отпустил тело раньше нас (но не в первые кадры запроса).
-      this._endDrag({ silent: true });
+    const helpers = Array.isArray(data.helpers) ? data.helpers : [];
+    const selfId = this._selfId();
+    const wasHelper = this._dragHelpers.has(selfId);
+
+    if (incoming !== DEMON_PHASE.STUNNED) {
+      if (this._draggingId || this._dragHelpers.size) this._endDrag({ silent: true, all: true });
+    } else {
+      if (this._draggingId && this._draggingId !== data.drag
+        && performance.now() - (this._dragStartedAt || 0) > 700) {
+        // Хост отпустил тело раньше нас (но не в первые кадры запроса).
+        this._endDrag({ silent: true, all: true });
+      }
+      this._dragHelpers = new Set(helpers.filter((id) => id && id !== selfId));
+      if (wasHelper !== this._dragHelpers.has(selfId)) this._applyDragSpeed();
+      if (this._draggingId === selfId || this._dragHelpers.has(selfId)) this._applyDragSpeed();
     }
+
     this.phase = incoming;
+    if (typeof data.car === 'number') this.carIndex = data.car === 1 ? 1 : 0;
     this.npc.setBlood(typeof data.blood === 'number' ? data.blood : 1);
     this.npc.setPose(
       incoming === DEMON_PHASE.HUNTING
@@ -8107,7 +8815,7 @@ class DemonDirector {
           : 'waking',
     );
     if (typeof data.x === 'number') {
-      const isLocalDrag = this._draggingId === this._selfId();
+      const isLocalDrag = this._draggingId === selfId;
       if (!isLocalDrag) this.npc.root.position.set(data.x, 0, Number(data.z) || 0);
     }
     if (typeof data.yaw === 'number') this.npc.setYaw(data.yaw, true);
@@ -8117,6 +8825,7 @@ class DemonDirector {
     }
     this.ui.setScare(true);
     this.world.setBlackout(true);
+    this._syncVisibility();
   }
 
   _hostGuestGrab(fromId) {
@@ -8126,13 +8835,19 @@ class DemonDirector {
     const npc = this.npc.root.position;
     const distance = Math.hypot(pose.x - npc.x, pose.z - npc.z);
     if (distance > CONFIG.npc.grabDistance + 0.7) return;
-    this._beginReveal('grab', true);
+    this._beginReveal('ticket', true);
   }
 
-  _hostGuestDrag(fromId, active) {
+  _hostGuestDrag(fromId, active, helper = false) {
     if (!fromId) return;
     if (!active) {
-      if (this._draggingId === fromId) this._endDrag({ silent: true });
+      if (helper) {
+        this._dragHelpers.delete(fromId);
+      } else if (this._draggingId === fromId) {
+        this._draggingId = null;
+        this._dragHelpers.clear();
+      }
+      this._stateClock = 0;
       return;
     }
     if (this.phase !== DEMON_PHASE.STUNNED) return;
@@ -8141,11 +8856,755 @@ class DemonDirector {
     const npc = this.npc.root.position;
     const distance = Math.hypot(pose.x - npc.x, pose.z - npc.z);
     if (distance > CONFIG.npc.grabDistance + 1.4) return;
-    this._draggingId = fromId;
+    if (!this._draggingId) {
+      this._draggingId = fromId;
+    } else if (helper && this._dragHelpers.size < 1 && this._draggingId !== fromId) {
+      this._dragHelpers.add(fromId);
+    }
     this._stateClock = 0;
   }
 }
 
+
+// =============================================================================
+// ПАССАЖИРЫ С БИЛЕТАМИ, ПРОВЕРКА, ДВЕРИ И ТОРМОЗ
+// =============================================================================
+
+/**
+ * Обычный пассажир на скамье: та же школа, что и у «пассажира без лица»,
+ * но попроще и с вариациями — пальто, шапка, шарф, поза.
+ */
+class SeatPassenger {
+  static PALETTES = [
+    { coat: 0x4a4f45, trousers: 0x33352f, scarf: 0x7a3f2f, hat: 0x2b2f2a, skin: 0xc7ab8d },
+    { coat: 0x3d4148, trousers: 0x2c2f33, scarf: 0x5a6d5a, hat: 0x1f2320, skin: 0xd2b79a },
+    { coat: 0x51413a, trousers: 0x3a342c, scarf: 0x8a7a4a, hat: 0x3b2a22, skin: 0xb39073 },
+    { coat: 0x2f3a33, trousers: 0x272b26, scarf: 0x6a4a5a, hat: 0x242a2c, skin: 0xc9b49c },
+  ];
+
+  constructor({ scene, parent, seat, index = 0 }) {
+    this.scene = scene;
+    this.seat = seat;
+    this.index = index;
+    this.root = new THREE.Group();
+    this.root.name = `Пассажир ${seat.seat}`;
+    this.root.position.set(seat.x, 0, seat.z);
+    this.root.rotation.y = seat.yaw;
+    (parent || scene).add(this.root);
+
+    this.hitMeshes = [];
+    this._mats = [];
+    this._time = index * 1.7;
+    this.checked = false;
+    this._targetYaw = seat.yaw;
+    const palette = SeatPassenger.PALETTES[index % SeatPassenger.PALETTES.length];
+    this._build(palette);
+  }
+
+  _mat(color, opts = {}) {
+    const material = new THREE.MeshStandardMaterial({
+      color,
+      roughness: opts.roughness ?? 0.9,
+      metalness: opts.metalness ?? 0.03,
+      emissive: opts.emissive ?? 0x000000,
+      emissiveIntensity: opts.emissiveIntensity ?? 0,
+    });
+    this._mats.push(material);
+    return material;
+  }
+
+  _add(geometry, material, parent, x=0, y=0, z=0, rx=0, ry=0, rz=0) {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(x, y, z);
+    mesh.rotation.set(rx, ry, rz);
+    parent.add(mesh);
+    this.hitMeshes.push(mesh);
+    return mesh;
+  }
+
+  _build(palette) {
+    const coat = this._mat(palette.coat, { roughness: 0.96 });
+    const dark = this._mat(0x2e312c, { roughness: 0.94 });
+    const trousers = this._mat(palette.trousers, { roughness: 0.97 });
+    const skin = this._mat(palette.skin, { roughness: 0.7 });
+    const scarf = this._mat(palette.scarf, { roughness: 0.9 });
+    const hat = this._mat(palette.hat, { roughness: 0.92 });
+    const leather = this._mat(0x241f1a, { roughness: 0.62, metalness: 0.1 });
+
+    this.hips = new THREE.Group();
+    this.hips.position.y = this.seat.y || 0.5;
+    this.root.add(this.hips);
+    this.body = new THREE.Group();
+    this.hips.add(this.body);
+
+    // Пальто и воротник.
+    this._add(new THREE.BoxGeometry(0.4, 0.58, 0.28), coat, this.body, 0, 0.3, 0);
+    this._add(new THREE.BoxGeometry(0.44, 0.1, 0.26), coat, this.body, 0, 0.56, 0);
+    this._add(new THREE.BoxGeometry(0.26, 0.09, 0.23), scarf, this.body, 0, 0.6, 0.01);
+    this._add(new THREE.BoxGeometry(0.06, 0.34, 0.02), dark, this.body, 0, 0.28, 0.145);
+
+    // Голова, шапка и лицо (без пугающих деталей — это обычные люди).
+    this.head = new THREE.Group();
+    this.head.position.set(0, 0.62, 0.01);
+    this.body.add(this.head);
+    this._add(new THREE.SphereGeometry(0.125, 14, 10), skin, this.head, 0, 0.16, 0);
+    this._add(new THREE.CylinderGeometry(0.132, 0.132, 0.09, 14), hat, this.head, 0, 0.26, 0);
+    this._add(new THREE.CylinderGeometry(0.15, 0.15, 0.02, 14), hat, this.head, 0, 0.22, 0.02);
+    this._add(new THREE.BoxGeometry(0.05, 0.014, 0.012), leather, this.head, -0.045, 0.17, 0.115);
+    this._add(new THREE.BoxGeometry(0.05, 0.014, 0.012), leather, this.head, 0.045, 0.17, 0.115);
+
+    // Руки: предплечья лежат на коленях.
+    const arm = (side) => {
+      const shoulder = new THREE.Group();
+      shoulder.position.set(side * 0.235, 0.5, 0);
+      this.body.add(shoulder);
+      this._add(new THREE.CapsuleGeometry(0.052, 0.22, 3, 8), coat, shoulder, 0, -0.13, 0.01);
+      const elbow = new THREE.Group();
+      elbow.position.set(0, -0.26, 0);
+      shoulder.add(elbow);
+      this._add(new THREE.CapsuleGeometry(0.045, 0.19, 3, 8), coat, elbow, 0, -0.08, 0.11, -1.15, 0, 0);
+      this._add(new THREE.SphereGeometry(0.05, 9, 7), skin, elbow, 0, -0.08, 0.22);
+      return shoulder;
+    };
+    arm(-1); arm(1);
+
+    // Ноги: бедро вперёд, голень вниз.
+    const leg = (side) => {
+      const hip = new THREE.Group();
+      hip.position.set(side * 0.1, 0, 0);
+      this.hips.add(hip);
+      this._add(new THREE.CapsuleGeometry(0.07, 0.24, 3, 8), trousers, hip, 0, -0.06, 0.2, -1.45, 0, 0);
+      const knee = new THREE.Group();
+      knee.position.set(0, -0.06, 0.42);
+      hip.add(knee);
+      this._add(new THREE.CapsuleGeometry(0.058, 0.26, 3, 8), trousers, knee, 0, -0.18, 0);
+      this._add(new THREE.BoxGeometry(0.12, 0.07, 0.23), leather, knee, 0, -0.34, 0.06);
+      return hip;
+    };
+    leg(-1); leg(1);
+
+    // Кольцо-подсветка.
+    this.marker = new THREE.Mesh(
+      new THREE.RingGeometry(0.28, 0.33, 22),
+      new THREE.MeshBasicMaterial({
+        color: 0xd9ffcb,
+        transparent: true,
+        opacity: 0.4,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    this.marker.rotation.x = -Math.PI / 2;
+    this.marker.position.y = 0.012;
+    this.marker.visible = false;
+    this.root.add(this.marker);
+
+    // Невидимый объём для наведения: между деталями тела есть щели,
+    // и без него E иногда «не видит» пассажира.
+    this.interactBox = new THREE.Mesh(
+      new THREE.BoxGeometry(0.78, 1.15, 0.86),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
+    );
+    this.interactBox.position.set(0, 0.95, 0.12);
+    this.root.add(this.interactBox);
+    this.hitMeshes.push(this.interactBox);
+  }
+
+  setHighlight(on) {
+    if (this.marker) this.marker.visible = Boolean(on);
+  }
+
+  update(dt, elapsed) {
+    this._time += dt;
+    const breathe = Math.sin(elapsed * 1.35 + this.index) * 0.006;
+    this.body.rotation.x = 0.12 + breathe;
+    this.head.rotation.y = Math.sin(elapsed * 0.17 + this.index * 2.1) * 0.18;
+    this.head.rotation.x = 0.06 + breathe * 0.8;
+    if (this.marker && this.marker.visible) {
+      this.marker.material.opacity = 0.3 + Math.sin(this._time * 3.6) * 0.14;
+    }
+  }
+}
+
+/** Луч из камеры по пассажирам, проверка билета и подсказки. */
+class TicketInspector {
+  constructor({ camera, player, ui, bus, passengers, onCheck }) {
+    this.camera = camera;
+    this.player = player;
+    this.ui = ui;
+    this.bus = bus;
+    this.passengers = passengers;
+    this.onCheck = onCheck;
+    this.suppressed = false;
+    this._ray = new THREE.Raycaster();
+    this._center = new THREE.Vector2(0, 0);
+    this._target = null;
+    this._targetDistance = Infinity;
+
+    this.bus.on('player:interact', (payload) => this._onInteract(payload));
+  }
+
+  setActive(active) {
+    this.active = Boolean(active);
+    if (!this.active && this._target) {
+      this._target.setHighlight(false);
+      this._target = null;
+    }
+  }
+
+  update(dt, elapsed, { enabled = true } = {}) {
+    for (const passenger of this.passengers) passenger.update(dt, elapsed);
+    this.active = Boolean(enabled);
+    if (!enabled) {
+      if (this._target) this._target.setHighlight(false);
+      this._target = null;
+      this.ui.hidePrompt(15);
+      return;
+    }
+
+    this.camera.updateMatrixWorld(true);
+    this._ray.setFromCamera(this._center, this.camera);
+    let closest = null;
+    let closestDistance = Infinity;
+    let hit = null;
+    for (const passenger of this.passengers) {
+      if (!passenger.root.visible) continue;
+      passenger.root.updateMatrixWorld(true);
+      const hits = this._ray.intersectObjects(passenger.hitMeshes, false);
+      if (!hits.length) continue;
+      if (hits[0].distance < closestDistance) {
+        closestDistance = hits[0].distance;
+        closest = passenger;
+        hit = hits[0];
+      }
+    }
+    const distance = closest
+      ? Math.hypot(this.player.position.x - closest.root.position.x, this.player.position.z - closest.root.position.z)
+      : Infinity;
+    if (closest && (closestDistance > CONFIG.npc.lookDistance + 1.2 || distance > CONFIG.mission.interactDistance + 0.8)) {
+      closest = null;
+    }
+    if (closest !== this._target) {
+      if (this._target) this._target.setHighlight(false);
+      this._target = closest;
+      if (closest) closest.setHighlight(true);
+    }
+    this._targetDistance = distance;
+
+    if (!closest) {
+      this.ui.hidePrompt(15);
+      return;
+    }
+    if (closest.checked) {
+      this.ui.showPrompt(`БИЛЕТ ПРОВЕРЕН // ${closest.seat.name}`, '', 'normal', 15);
+      return;
+    }
+    if (distance > CONFIG.mission.interactDistance) {
+      this.ui.showPrompt('ПОДОЙДИТЕ К ПАССАЖИРУ', '', 'normal', 15);
+      return;
+    }
+    this.ui.showPrompt('ПРОВЕРИТЬ БИЛЕТ', 'E', 'normal', 15);
+  }
+
+  _onInteract({ held } = {}) {
+    if (!held || !this.active || !this._target) return;
+    const passenger = this._target;
+    if (passenger.checked) return;
+    if (this._targetDistance > CONFIG.mission.interactDistance) return;
+    passenger.checked = true;
+    passenger.setHighlight(false);
+    this._target = null;
+    this.ui.showTicket({
+      name: passenger.seat.name,
+      seat: `№ ${passenger.seat.seat}`,
+      serial: passenger.seat.serial,
+      status: 'ДЕЙСТВИТЕЛЕН',
+      note: 'Штамп проводника поставлен. Смена идёт по расписанию.',
+      invalid: false,
+    });
+    this.ui.hidePrompt(15);
+    this.bus.emit('ticket:checked', { index: passenger.index, name: passenger.seat.name, seat: passenger.seat.seat });
+    if (this.onCheck) this.onCheck(passenger);
+  }
+}
+
+/** Тормозной кран в служебном вагоне — единственный путь к спасению. */
+class BrakeValve {
+  constructor({ parent, position = { x: 0.85, y: 1.15, z: -15.15 } }) {
+    this.root = new THREE.Group();
+    this.root.position.set(position.x, position.y, position.z);
+    this.hitMeshes = [];
+    (parent || this.root).add(this.root);
+
+    const metal = new THREE.MeshStandardMaterial({ color: 0x3c403a, roughness: 0.55, metalness: 0.55 });
+    const red = new THREE.MeshStandardMaterial({
+      color: 0x6e130d,
+      roughness: 0.5,
+      metalness: 0.2,
+      emissive: 0x2a0502,
+      emissiveIntensity: 0.7,
+    });
+
+    // Труба и колесо.
+    const pipe = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 1.1, 10), metal);
+    pipe.rotation.z = Math.PI / 2;
+    pipe.position.set(0, -0.55, 0);
+    this.root.add(pipe);
+    this.wheel = new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.035, 10, 26), red);
+    this.root.add(this.wheel);
+    this.hitMeshes.push(this.wheel);
+    for (let i = 0; i < 3; i += 1) {
+      const spoke = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.03, 0.03), metal);
+      spoke.rotation.z = (i * Math.PI) / 3;
+      this.wheel.add(spoke);
+    }
+    const handle = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.34), red);
+    handle.position.set(0.0, 0, 0.2);
+    this.root.add(handle);
+    this.hitMeshes.push(handle);
+    const plate = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.34, 0.16),
+      new THREE.MeshStandardMaterial({ color: 0xd9d2b4, roughness: 0.9, emissive: 0x3a3320, emissiveIntensity: 0.2 }),
+    );
+    plate.position.set(0, 0.36, 0.02);
+    this.root.add(plate);
+
+    // Объём наведения: колесо — полый тор, луч проходит сквозь него.
+    const hitbox = new THREE.Mesh(
+      new THREE.BoxGeometry(0.6, 0.6, 0.3),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
+    );
+    hitbox.position.set(0, 0, 0.05);
+    this.root.add(hitbox);
+    this.hitMeshes.push(hitbox);
+    this._baseY = position.y;
+  }
+
+  setHighlight(on, progress = 0) {
+    this.wheel.material.emissiveIntensity = on ? 0.9 + progress * 1.8 : 0.7;
+  }
+
+  update(elapsed, active) {
+    this.wheel.rotation.z += 0.008 + (active ? 0.05 : 0);
+    this.root.position.y = this._baseY + Math.sin(elapsed * 1.4) * 0.006;
+  }
+}
+
+/**
+ * Смена: инструктаж, проверка билетов, побег и тормоз.
+ * Держит только сюжетное состояние; физикой занимаются другие системы.
+ */
+class MissionDirector {
+  constructor({ bus, ui, network, demon, tickets, selfId }) {
+    this.bus = bus;
+    this.ui = ui;
+    this.network = network;
+    this.demon = demon;
+    this.tickets = tickets;
+    this.selfId = selfId;
+    this.checked = new Set();
+    this.total = tickets.length;
+    this.step = 0;
+    this.started = false;
+    this.briefingOpen = false;
+    this._briefingBound = false;
+
+    this.bus.on('ticket:checked', ({ index } = {}) => this._markTicket(index));
+    this.bus.on('ticket:remote', ({ index } = {}) => this._markTicket(index));
+    this.bus.on('demon:awakened', ({ source } = {}) => this._onAwakened(source));
+    this.bus.on('demon:escape', () => this._onEscape());
+  }
+
+  begin() {
+    this.started = true;
+    this.checked.clear();
+    this.step = 0;
+    this._render();
+    this.openBriefing();
+  }
+
+  openBriefing() {
+    if (!this.started || this.briefingOpen) return;
+    this.briefingOpen = true;
+    this.ui.showBriefing();
+    if (!this._briefingBound) {
+      this._briefingBound = true;
+      this._onKey = (event) => {
+        if (!this.briefingOpen) return;
+        if (event.code !== 'KeyE' && event.code !== 'Enter' && event.code !== 'Space') return;
+        event.preventDefault();
+        this.acceptBriefing();
+      };
+      window.addEventListener('keydown', this._onKey, { capture: true });
+    }
+  }
+
+  acceptBriefing() {
+    if (!this.briefingOpen) return;
+    this.briefingOpen = false;
+    this.ui.hideBriefing();
+    this.bus.emit('mission:briefingAccepted', {});
+  }
+
+  _markTicket(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.total) return;
+    if (this.checked.has(index)) return;
+    this.checked.add(index);
+    if (this.checked.size >= this.total && this.step < 1) this.step = 1;
+    this._render();
+  }
+
+  _onAwakened(source) {
+    if (source === 'ticket') {
+      this.ui.showTicket({
+        name: 'ПАССАЖИР БЕЗ ЛИЦА',
+        seat: '№ 05',
+        serial: '—',
+        status: 'НЕТ БИЛЕТА',
+        note: 'Штампа нет. На левой руке шесть пальцев. Он уже смотрит на вас.',
+        invalid: true,
+        seconds: 6.5,
+      });
+    }
+    if (this.step < 2) this.step = 2;
+    this._render();
+  }
+
+  onCarChanged(index) {
+    if (index === 1 && this.step === 2) {
+      this.step = 3;
+      this._render();
+    }
+  }
+
+  _onEscape() {
+    this.step = 4;
+    this._render();
+  }
+
+  update() {
+    if (this.started) this._render();
+  }
+
+  _render() {
+    if (!this.started) return;
+    if (this.step === 0) {
+      this.ui.setObjective({
+        text: 'ПРОВЕРЬТЕ БИЛЕТЫ ПАССАЖИРОВ',
+        progress: `${this.checked.size} / ${this.total}`,
+        danger: false,
+      });
+      return;
+    }
+    if (this.step === 1) {
+      this.ui.setObjective({
+        text: 'ПАССАЖИР НА МЕСТЕ 05 НЕ ПРЕДЪЯВИЛ БИЛЕТ',
+        progress: 'НАЙДИТЕ ЕГО',
+        danger: false,
+      });
+      return;
+    }
+    if (this.step === 2) {
+      this.ui.setObjective({
+        text: 'БЕГИТЕ В СОСЕДНИЙ ВАГОН // СОРВИТЕ ТОРМОЗ',
+        progress: 'ОН ИДЁТ ЗА ВАМИ',
+        danger: true,
+      });
+      return;
+    }
+    if (this.step === 3) {
+      this.ui.setObjective({
+        text: 'СОРВИТЕ ТОРМОЗНОЙ КРАН У ДВЕРИ',
+        progress: 'УДЕРЖИВАЙТЕ E',
+        danger: true,
+      });
+      return;
+    }
+    this.ui.setObjective({
+      text: 'ТОРМОЗ СОРВАН // СМЕНА ОКОНЧЕНА',
+      progress: '',
+      danger: false,
+    });
+  }
+}
+
+/** Переход между вагонами: дверь в конце салона. */
+class DoorDirector {
+  constructor({ camera, player, ui, bus, getCar, onSwitch }) {
+    this.camera = camera;
+    this.player = player;
+    this.ui = ui;
+    this.bus = bus;
+    this.getCar = getCar;
+    this.onSwitch = onSwitch;
+    this._direction = new THREE.Vector3();
+    this._cooldown = 0;
+    this._active = false;
+    this._target = 0;
+    this.bus.on('player:interact', ({ held } = {}) => this._onInteract(held));
+  }
+
+  update(dt, enabled = true) {
+    this._cooldown = Math.max(0, this._cooldown - dt);
+    if (!enabled) {
+      this._active = false;
+      this.ui.hidePrompt(8);
+      return;
+    }
+    const car = this.getCar();
+    const z = this.player.position.z;
+    const x = this.player.position.x;
+    let near = false;
+    let target = 0;
+    if (car === 0 && z < -13.1 && Math.abs(x) < 1.25) {
+      near = true;
+      target = 1;
+    } else if (car === 1 && z > 13.1 && Math.abs(x) < 1.25) {
+      near = true;
+      target = 0;
+    }
+    if (near) {
+      this.camera.getWorldDirection(this._direction);
+      const facing = target === 1
+        ? this._direction.z < -0.45
+        : this._direction.z > 0.45;
+      near = facing;
+    }
+    this._active = near && this._cooldown <= 0;
+    this._target = target;
+    if (!this._active) {
+      this.ui.hidePrompt(8);
+      return;
+    }
+    const text = target === 1
+      ? 'ПЕРЕЙТИ В СЛЕДУЮЩИЙ ВАГОН'
+      : 'ВЕРНУТЬСЯ В ПАССАЖИРСКИЙ ВАГОН';
+    this.ui.showPrompt(text, 'E', 'normal', 8);
+  }
+
+  _onInteract(held) {
+    if (!held || !this._active) return;
+    this._cooldown = 1.1;
+    this._active = false;
+    this.ui.hidePrompt(8);
+    if (this.onSwitch) this.onSwitch(this._target);
+  }
+}
+
+/** Тормозной кран: удержание E до победы. */
+class BrakeDirector {
+  constructor({ camera, player, ui, bus, demon, brake, getCar }) {
+    this.camera = camera;
+    this.player = player;
+    this.ui = ui;
+    this.bus = bus;
+    this.demon = demon;
+    this.brake = brake;
+    this.getCar = getCar;
+    this._ray = new THREE.Raycaster();
+    this._center = new THREE.Vector2(0, 0);
+    this._held = false;
+    this._progress = 0;
+    this._visible = false;
+    this.bus.on('player:interact', ({ held } = {}) => { this._held = Boolean(held); if (!held) this._progress = 0; });
+  }
+
+  update(dt, elapsed, enabled = true) {
+    const active = enabled && this.getCar() === 1 && this.demon.phase !== DEMON_PHASE.INCOGNITO
+      && this.demon.phase !== DEMON_PHASE.DEAD;
+    this.brake.update(elapsed, this._visible);
+    if (!active) {
+      this._visible = false;
+      this._progress = 0;
+      this.brake.setHighlight(false);
+      this.ui.hidePrompt(18);
+      return;
+    }
+
+    this.camera.updateMatrixWorld(true);
+    this._ray.setFromCamera(this._center, this.camera);
+    const hits = this._ray.intersectObjects(this.brake.hitMeshes, false);
+    const distance = Math.hypot(
+      this.player.position.x - this.brake.root.position.x,
+      this.player.position.z - this.brake.root.position.z,
+    );
+    this._visible = Boolean(hits.length && hits[0].distance < 3.4 && distance < 3.0);
+    if (!this._visible) {
+      this._progress = 0;
+      this.brake.setHighlight(false);
+      this.ui.hidePrompt(18);
+      return;
+    }
+
+    if (this._held) this._progress += dt;
+    const ratio = clamp(this._progress / CONFIG.mission.brakeHold, 0, 1);
+    this.brake.setHighlight(true, ratio);
+    const percent = Math.round(ratio * 100);
+    this.ui.showPrompt(
+      ratio > 0 ? `СРЫВАЕТЕ ТОРМОЗ… ${percent}%` : 'УДЕРЖИВАЙТЕ E — СОРВАТЬ ТОРМОЗ',
+      'E',
+      'danger',
+      18,
+    );
+    if (this._progress >= CONFIG.mission.brakeHold) {
+      this._progress = 0;
+      this._held = false;
+      this.ui.hidePrompt(999);
+      this.demon.requestEscape();
+    }
+  }
+}
+
+/**
+ * Каталог открытых лобби. Хост объявляет код в общем relay-канале,
+ * игроки в меню видят список и входят без кода.
+ */
+class LobbyDirectory {
+  constructor({ store, bus }) {
+    this.store = store;
+    this.bus = bus;
+    this.ready = false;
+    this.room = null;
+    this.action = null;
+    this.local = null;
+    this.entries = new Map();
+    this.lastError = null;
+    this._starting = null;
+    this._timer = 0;
+    this._announceTimer = 0;
+  }
+
+  async _pickRelay() {
+    const custom = String(this.store.values.relayCustom || '').trim();
+    if (/^wss?:\/\/\S+$/i.test(custom)) return custom;
+    const urls = CONFIG.network.relay.transports.mqtt.slice(0, 3);
+    for (const url of urls) {
+      // eslint-disable-next-line no-await-in-loop
+      const ok = await probeSocket(url, { mqtt: true, timeout: 2500 });
+      if (ok.ok) return url;
+    }
+    return null;
+  }
+
+  async start() {
+    if (this.ready) return true;
+    if (this._starting) return this._starting;
+    this._starting = (async () => {
+      try {
+        const mod = await loadRelayModule();
+        const url = await this._pickRelay();
+        if (!url) throw new Error('NO_RELAY');
+        const cfg = CONFIG.network.relay;
+        const room = mod.joinMqtt({
+          appId: cfg.appId,
+          password: cfg.password,
+          relayConfig: { urls: [url], redundancy: 1 },
+          rtcConfig: { iceServers: CONFIG.network.iceServers },
+        }, `${CONFIG.network.prefix}directory`, {});
+        this.room = room;
+        this.action = room.makeAction('dir');
+        this.action.onMessage = (data, context) => this._onMessage(data, context);
+        room.onPeerLeave = (id) => this._dropPeer(id);
+        this.ready = true;
+        this._timer = window.setInterval(() => this._tick(), 2000);
+        this._announceTimer = window.setInterval(() => this._announce(), 4000);
+        this._announce();
+        this.bus.emit('directory:update', this.snapshot());
+        return true;
+      } catch (error) {
+        this.lastError = error;
+        this._starting = null;
+        this.bus.emit('directory:error', { message: error && error.message });
+        return false;
+      }
+    })();
+    return this._starting;
+  }
+
+  setLocal(info) {
+    this.local = info ? { ...info, part: CONFIG.part } : null;
+    this._announce();
+  }
+
+  clearLocal() {
+    this.local = null;
+  }
+
+  _announce() {
+    if (!this.ready || !this.local || !this.action) return;
+    try {
+      const pending = this.action.send({
+        kind: 'lobby',
+        ...this.local,
+        ts: Date.now(),
+      });
+      if (pending && pending.catch) pending.catch(() => {});
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  _onMessage(data, context) {
+    if (!data || data.kind !== 'lobby' || !data.code) return;
+    const id = context && context.peerId;
+    if (!id) return;
+    const existing = this.entries.get(id);
+    this.entries.set(id, {
+      id,
+      code: String(data.code).toUpperCase().slice(0, 5),
+      host: String(data.host || 'ПРОВОДНИК').slice(0, 28),
+      crew: Math.max(1, Number(data.crew) || 1),
+      max: Math.max(2, Number(data.max) || 6),
+      part: Number(data.part) || 0,
+      seen: Date.now(),
+      created: existing ? existing.created : Date.now(),
+    });
+    this.bus.emit('directory:update', this.snapshot());
+  }
+
+  _dropPeer(id) {
+    if (!this.entries.has(id)) return;
+    this.entries.delete(id);
+    this.bus.emit('directory:update', this.snapshot());
+  }
+
+  _tick() {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, entry] of this.entries) {
+      if (now - entry.seen > 12000) {
+        this.entries.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) this.bus.emit('directory:update', this.snapshot());
+  }
+
+  snapshot() {
+    return Array.from(this.entries.values())
+      .sort((a, b) => b.seen - a.seen)
+      .slice(0, 20);
+  }
+
+  stop() {
+    window.clearInterval(this._timer);
+    window.clearInterval(this._announceTimer);
+    this._timer = 0;
+    this._announceTimer = 0;
+    this.entries.clear();
+    if (this.room && this.room.leave) {
+      try {
+        this.room.leave();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    this.room = null;
+    this.action = null;
+    this.ready = false;
+    this._starting = null;
+  }
+}
 
 // =============================================================================
 // ИНТЕРФЕЙС
@@ -8246,6 +9705,23 @@ class UIManager {
       listen: $('#hud-listen'),
       listenText: $('#hud-listen-text'),
       scare: $('#scare-overlay'),
+      objective: $('#hud-objective'),
+      objectiveText: $('#objective-text'),
+      objectiveProgress: $('#objective-progress'),
+      ticketCard: $('#ticket-card'),
+      ticketStatus: $('#ticket-status'),
+      ticketName: $('#ticket-name'),
+      ticketSeat: $('#ticket-seat'),
+      ticketSerial: $('#ticket-serial'),
+      ticketNote: $('#ticket-note'),
+      briefing: $('#briefing'),
+      briefingAccept: $('#btn-briefing-accept'),
+      carFade: $('#car-fade'),
+      serverBrowser: $('#server-browser'),
+      serverList: $('#server-list'),
+      serverEmpty: $('#server-empty'),
+      serverCount: $('#server-count'),
+      refreshServers: $('#btn-refresh-servers'),
 
       pauseResume: $('#btn-resume'),
       pauseSettings: $('#btn-pause-settings'),
@@ -8387,6 +9863,27 @@ class UIManager {
     });
     this.el.joinForm.addEventListener('submit', (event) => this._onJoinSubmit(event));
     this.el.joinInput.addEventListener('input', () => this._sanitizeJoinInput());
+
+    if (this.el.serverList) {
+      this.el.serverList.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-code]');
+        if (!button) return;
+        this.audio.uiConfirm();
+        this.bus.emit('ui:joinServer', button.dataset.code);
+      });
+    }
+    if (this.el.refreshServers) {
+      this.el.refreshServers.addEventListener('click', () => {
+        this.audio.uiClick();
+        this.bus.emit('ui:refreshServers');
+      });
+    }
+    if (this.el.briefingAccept) {
+      this.el.briefingAccept.addEventListener('click', () => {
+        this.audio.uiConfirm();
+        this.bus.emit('ui:acceptBriefing');
+      });
+    }
 
     this.el.pauseResume.addEventListener('click', () => {
       this.audio.uiConfirm();
@@ -8889,6 +10386,7 @@ class UIManager {
   openJoin() {
     this.el.menu.hidden = true;
     this.el.join.hidden = false;
+    this.bus.emit('ui:joinOpened');
     this._joinToken += 1;
     this._joining = false;
     this.el.joinSubmit.disabled = false;
@@ -8990,7 +10488,7 @@ class UIManager {
     this.el.hud.hidden = false;
     this.el.hud.classList.remove('is-paused');
     this.el.hints.classList.remove('is-faded');
-    this.hidePrompt();
+    this.hidePrompt(999);
     this.setScare(false);
     this.setListeningStatus({ mic: 'off', speech: 'off' });
     this.setLobbyCode(lobbyCode);
@@ -9006,7 +10504,7 @@ class UIManager {
 
   showMenu() {
     this._stopHaunt();
-    this.hidePrompt();
+    this.hidePrompt(999);
     this.setScare(false);
     this.el.hud.hidden = true;
     this.el.pause.hidden = true;
@@ -9262,7 +10760,7 @@ class UIManager {
     this._stopHaunt();
     this.el.hud.hidden = true;
     this.el.pause.hidden = true;
-    this.hidePrompt();
+    this.hidePrompt(999);
     if (this.el.endedKicker) {
       this.el.endedKicker.textContent = kicker || 'ЛОББИ БОЛЬШЕ НЕ СУЩЕСТВУЕТ';
     }
@@ -9303,11 +10801,17 @@ class UIManager {
   // Часть III: подсказка взаимодействия, «слух» и паника
   // ---------------------------------------------------------------------------
 
-  showPrompt(text, key = 'E', tone = 'normal') {
+  /**
+   * Подсказка с приоритетом: демон (20) важнее билета (12) и двери (8).
+   * Без приоритетов подсказки разных систем перекрывали друг друга.
+   */
+  showPrompt(text, key = 'E', tone = 'normal', priority = 10) {
     if (!this.el.prompt) return;
-    const signature = `${tone}|${key}|${text}`;
+    if (priority < (this._promptPriority || 0)) return;
+    const signature = `${priority}|${tone}|${key}|${text}`;
     if (signature === this._promptKey) return;
     this._promptKey = signature;
+    this._promptPriority = priority;
     this._promptTone = tone;
     if (this.el.promptKey) {
       this.el.promptKey.textContent = key || '';
@@ -9318,9 +10822,101 @@ class UIManager {
     this.el.prompt.hidden = false;
   }
 
-  hidePrompt() {
+  hidePrompt(priority = 10) {
+    if (priority < (this._promptPriority || 0)) return;
+    this._promptPriority = 0;
     this._promptKey = '';
     if (this.el.prompt) this.el.prompt.hidden = true;
+  }
+
+  /** Задача смены в верхней части HUD. */
+  setObjective({ text, progress = '', danger = false, hidden = false } = {}) {
+    if (!this.el.objective) return;
+    if (text && this.el.objectiveText) this.el.objectiveText.textContent = text;
+    if (progress !== undefined && this.el.objectiveProgress) {
+      this.el.objectiveProgress.textContent = progress;
+      this.el.objectiveProgress.hidden = !progress;
+    }
+    this.el.objective.classList.toggle('is-danger', Boolean(danger));
+    this.el.objective.classList.toggle('is-hidden', Boolean(hidden));
+  }
+
+  /** Билетная карточка: валидный билет или «без билета». */
+  showTicket({ name, seat, serial, status, note, invalid = false, seconds = 4.6 } = {}) {
+    if (!this.el.ticketCard) return;
+    this.el.ticketCard.dataset.state = invalid ? 'invalid' : 'valid';
+    if (this.el.ticketStatus) this.el.ticketStatus.textContent = status || (invalid ? 'НЕТ БИЛЕТА' : 'ДЕЙСТВИТЕЛЕН');
+    if (this.el.ticketName) this.el.ticketName.textContent = name || '—';
+    if (this.el.ticketSeat) this.el.ticketSeat.textContent = seat || '—';
+    if (this.el.ticketSerial) this.el.ticketSerial.textContent = serial || '—';
+    if (this.el.ticketNote) this.el.ticketNote.textContent = note || '';
+    this.el.ticketCard.hidden = false;
+    window.clearTimeout(this._ticketTimer);
+    this._ticketTimer = window.setTimeout(() => this.hideTicket(), seconds * 1000);
+  }
+
+  hideTicket() {
+    window.clearTimeout(this._ticketTimer);
+    if (this.el.ticketCard) this.el.ticketCard.hidden = true;
+  }
+
+  showBriefing() {
+    if (this.el.briefing) this.el.briefing.hidden = false;
+  }
+
+  hideBriefing() {
+    if (this.el.briefing) this.el.briefing.hidden = true;
+  }
+
+  get briefingOpen() {
+    return Boolean(this.el.briefing && !this.el.briefing.hidden);
+  }
+
+  /** Короткое затемнение для перехода между вагонами. */
+  fadeCar(active) {
+    if (!this.el.carFade) return;
+    this.el.carFade.classList.toggle('is-active', Boolean(active));
+  }
+
+  /** Список открытых вагонов в «Подключиться». */
+  setServerList(servers = [], { loading = false } = {}) {
+    if (!this.el.serverList) return;
+    const list = Array.isArray(servers) ? servers : [];
+    if (this.el.serverCount) {
+      this.el.serverCount.textContent = `${list.length} ${list.length === 1 ? 'ВАГОН' : 'ВАГОНОВ'}`;
+    }
+    if (!list.length) {
+      this.el.serverList.innerHTML = '';
+      const row = document.createElement('li');
+      row.className = `server-empty${loading ? ' server-loading' : ''}`;
+      row.textContent = loading ? 'ПОИСК ВАГОНОВ…' : 'ОТКРЫТЫХ ВАГОНОВ НЕ НАЙДЕНО // СОЗДАЙТЕ СВОЙ';
+      this.el.serverList.appendChild(row);
+      return;
+    }
+    const fragment = document.createDocumentFragment();
+    for (const server of list) {
+      const item = document.createElement('li');
+      item.className = 'server-row';
+      const main = document.createElement('div');
+      main.className = 'server-row-main';
+      const title = document.createElement('b');
+      title.textContent = server.host || 'БЕЗЫМЯННЫЙ ПРОВОДНИК';
+      const sub = document.createElement('small');
+      const partName = server.part >= 4 ? 'ЧАСТЬ IV' : server.part === 3 ? 'ЧАСТЬ III' : 'РЕЙС 06';
+      sub.textContent = `КОД ${server.code} // ${partName}`;
+      main.append(title, sub);
+      const crew = document.createElement('span');
+      crew.className = 'server-crew';
+      crew.textContent = `${server.crew || 1} / ${server.max || 6}`;
+      const join = document.createElement('button');
+      join.type = 'button';
+      join.textContent = 'ВОЙТИ';
+      join.dataset.code = server.code;
+      item.append(main, crew, join);
+      fragment.appendChild(item);
+    }
+    this.el.serverList.innerHTML = '';
+    this.el.serverList.appendChild(fragment);
   }
 
   /** Состояние микрофона: слушает ли вагон игрока и доступна ли речь. */
@@ -9574,6 +11170,52 @@ class Game {
       onGameOver: (payload) => this._onDemonGameOver(payload),
     });
 
+    // Пассажиры с билетами: четыре места из CONFIG.npc.seats.
+    this.passengers = CONFIG.npc.seats.map((seat, index) => new SeatPassenger({
+      scene: this.scene,
+      parent: this.world.group,
+      seat: { ...seat, yaw: seat.x < 0 ? Math.PI / 2 : -Math.PI / 2, y: 0.52 },
+      index,
+    }));
+    this.ticketInspector = new TicketInspector({
+      camera: this.camera,
+      player: this.player,
+      ui: this.ui,
+      bus: this.bus,
+      passengers: this.passengers,
+      onCheck: (passenger) => this._onTicketChecked(passenger),
+    });
+    this.brakeValve = new BrakeValve({ parent: this.world.group });
+    this.brakeValve.root.visible = false;
+    this.brakeDirector = new BrakeDirector({
+      camera: this.camera,
+      player: this.player,
+      ui: this.ui,
+      bus: this.bus,
+      demon: this.demon,
+      brake: this.brakeValve,
+      getCar: () => this.demon.localCar,
+    });
+    this.doorDirector = new DoorDirector({
+      camera: this.camera,
+      player: this.player,
+      ui: this.ui,
+      bus: this.bus,
+      getCar: () => this.demon.localCar,
+      onSwitch: (car) => this._switchCar(car),
+    });
+    this.mission = new MissionDirector({
+      bus: this.bus,
+      ui: this.ui,
+      network: this.network,
+      demon: this.demon,
+      tickets: this.passengers,
+      selfId: () => this.network.selfId,
+    });
+    this.directory = new LobbyDirectory({ store: this.store, bus: this.bus });
+    this._switchingCar = false;
+    this._carTimer = 0;
+
     this._localInCar = false;
     this._demonDeath = false;
     this.network.setLocalStateProvider(() => {
@@ -9626,6 +11268,31 @@ class Game {
     this.bus.on('ui:resume', () => this.resumeSession());
     this.bus.on('ui:exit', () => this.exitToMenu());
     this.bus.on('settings:sensitivity', (value) => this.player.setSensitivity(value));
+
+    // Часть IV: инструктаж, двери, тормоз и каталог вагонов.
+    this.bus.on('ui:acceptBriefing', () => {
+      this.mission.acceptBriefing();
+      this.audio.uiConfirm();
+    });
+    this.bus.on('ui:joinServer', (code) => this._joinByCode(code));
+    this.bus.on('ui:refreshServers', () => this._refreshServers());
+    this.bus.on('ui:joinOpened', () => {
+      this.ui.setServerList([], { loading: true });
+      this.directory.start().then((ok) => {
+        if (ok) this.ui.setServerList(this.directory.snapshot(), { loading: false });
+      });
+    });
+    this.bus.on('directory:update', (list) => {
+      if (this.ui.el.join && !this.ui.el.join.hidden) {
+        this.ui.setServerList(list, { loading: false });
+      }
+    });
+    this.bus.on('directory:error', () => {
+      if (this.ui.el.join && !this.ui.el.join.hidden) {
+        this.ui.setServerList([], { loading: false });
+      }
+    });
+    this.bus.on('network:roster', () => this._syncDirectory());
 
     this.bus.on('settings:voiceEnabled', (enabled) => this.voice.setEnabled(enabled));
     this.bus.on('settings:voiceMode', (mode) => this.voice.setMode(mode));
@@ -9797,6 +11464,14 @@ class Game {
     }
 
     this.session = this.network.session;
+    // Хост сразу объявляет свой вагон в каталоге: игрокам не нужен код.
+    this.directory.start().then(() => this._syncDirectory());
+    this.directory.setLocal({
+      code: result.code,
+      host: this.store.values.callsign || 'ПРОВОДНИК',
+      crew: Math.max(1, this.network.getPlayers().length),
+      max: CONFIG.network.maxPlayers || 6,
+    });
     this.ui.showLobby({ code: result.code, mode: 'host' });
     const channelName = result.transport === 'relay' && result.strategy
       ? String(result.strategy).toUpperCase()
@@ -9827,6 +11502,105 @@ class Game {
       'success',
       4600,
     );
+  }
+
+  /** Гасим сюжетные подсказки, когда сеанс заканчивается. */
+  _resetMissionSystems() {
+    this.mission.started = false;
+    this.mission.briefingOpen = false;
+    this.mission.checked.clear();
+    this.ui.hideBriefing();
+    this.ui.hideTicket();
+    this.ui.setObjective({ text: '', progress: '', hidden: true });
+    this.ui.fadeCar(false);
+    this.ui.hidePrompt(999);
+    this._switchingCar = false;
+    window.clearTimeout(this._carTimer);
+    for (const passenger of this.passengers) {
+      passenger.checked = false;
+      passenger.root.visible = true;
+      passenger.setHighlight(false);
+    }
+    this.world.setCarVariant(0);
+    this.brakeValve.root.visible = false;
+    this.demon.setLocalCar(0);
+    this.directory.clearLocal();
+  }
+
+  _onTicketChecked(passenger) {
+    if (!passenger) return;
+    const total = this.passengers.length;
+    const checked = this.passengers.filter((entry) => entry.checked).length;
+    this.network.sendDemon({ kind: 'ticket', index: passenger.index });
+    if (checked >= total) {
+      this.audio.uiError();
+      this.demon.wakeFromTicket();
+      return;
+    }
+    this.ui.showToast(`БИЛЕТ ПРОВЕРЕН // ${checked} ИЗ ${total}`, 'info', 2200);
+  }
+
+  /** Дверь в конце салона: затемнение и перенос в другой вагон. */
+  _switchCar(car) {
+    const next = car === 1 ? 1 : 0;
+    if (next === this.demon.localCar || this._switchingCar) return;
+    this._switchingCar = true;
+    this.player.setEnabled(false);
+    this.ui.hidePrompt(999);
+    this.ui.fadeCar(true);
+    this.audio.hitch();
+    this._carTimer = window.setTimeout(() => {
+      this.demon.setLocalCar(next);
+      this.world.setCarVariant(next);
+      for (const passenger of this.passengers) {
+        passenger.root.visible = next === 0;
+        passenger.setHighlight(false);
+      }
+      this.brakeValve.root.visible = next === 1;
+      // Входим через тамбур: следующий вагон начинается с дальнего конца.
+      const z = next === 1 ? 13.55 : -13.55;
+      this.player.position.set(0.08, 0, z);
+      this.player.velocity.set(0, 0, 0);
+      this.player._syncCamera(0);
+      this.mission.onCarChanged(next);
+      this.bus.emit('demon:changedCar', { car: next });
+      this._carTimer = window.setTimeout(() => {
+        this.ui.fadeCar(false);
+        this._switchingCar = false;
+        if (this.state === STATE.PLAYING) this.player.setEnabled(true);
+      }, 320);
+    }, 380);
+  }
+
+  _joinByCode(raw) {
+    const code = this.network.sanitizeCode(typeof raw === 'string' ? raw : raw && raw.code);
+    if (!code || code.length !== CONFIG.network.lobbyCodeLength) {
+      this.ui.showToast('КОД ЛОББИ НЕ РАСПОЗНАН.', 'warning', 3600);
+      return;
+    }
+    if (this.state !== STATE.MENU) return;
+    if (this.ui.el.joinInput) this.ui.el.joinInput.value = code;
+    this.audio.uiConfirm();
+    if (this.ui.el.joinForm) {
+      this.ui.el.joinForm.dispatchEvent(new Event('submit', { cancelable: true }));
+    }
+  }
+
+  async _refreshServers() {
+    this.ui.setServerList([], { loading: true });
+    const ok = await this.directory.start();
+    if (ok) this.ui.setServerList(this.directory.snapshot(), { loading: false });
+  }
+
+  _syncDirectory() {
+    if (!this.session || !this.network.isActive) return;
+    const crew = Math.max(1, this.network.getPlayers().length);
+    this.directory.setLocal({
+      code: this.session.code,
+      host: this.store.values.callsign || 'ПРОВОДНИК',
+      crew,
+      max: CONFIG.network.maxPlayers || 6,
+    });
   }
 
   _spawnForSelf() {
@@ -9860,6 +11634,11 @@ class Game {
     this.audio.setScene('game');
     this.voice.setLocalInCar(true);
     this.demon.activate();
+    this.demon.setLocalCar(0);
+    this.world.setCarVariant(0);
+    this.brakeValve.root.visible = false;
+    for (const passenger of this.passengers) passenger.root.visible = true;
+    this.mission.begin();
     this.voiceWatcher.start();
     this.clock.getDelta();
 
@@ -9892,6 +11671,7 @@ class Game {
     this.remotePlayers.clear();
     this.network.leave();
     this.session = null;
+    this._resetMissionSystems();
 
     this.audio.setScene('menu');
     this.ui.showMenu();
@@ -9932,6 +11712,7 @@ class Game {
     this.voice.leave();
     this.remotePlayers.clear();
     this.session = null;
+    this._resetMissionSystems();
     this.audio.setScene('menu');
 
     let title = 'ХОСТ ПОКИНУЛ ВАГОН';
@@ -10124,6 +11905,7 @@ class Game {
     this.remotePlayers.clear();
     this.network.leave();
     this.session = null;
+    this._resetMissionSystems();
 
     this.ui.hideEnded();
     this.audio.setScene('menu');
@@ -10161,6 +11943,13 @@ class Game {
       // Пассажир думает после игрока: цель уже сдвинулась в этом кадре.
       this.demon.update(dt, this.elapsed);
       this.voiceWatcher.update(dt);
+      const uiEnabled = !this.mission.briefingOpen && !this._switchingCar;
+      this.ticketInspector.update(dt, this.elapsed, {
+        enabled: uiEnabled && this.demon.localCar === 0,
+      });
+      this.doorDirector.update(dt, uiEnabled);
+      this.brakeDirector.update(dt, this.elapsed, uiEnabled);
+      this.mission.update(dt);
     } else if (this.state === STATE.MENU || this.state === STATE.LOBBY) {
       this._updateMenuCamera(this.elapsed);
       // В меню пассажир просто сидит — анимация нужна и здесь.
