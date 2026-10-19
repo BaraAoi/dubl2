@@ -1944,6 +1944,185 @@
       opacity: 0.18;
     }
 
+    /* ---------- HUD: взаимодействие с пассажиром ---------- */
+
+    .hud-prompt {
+      position: absolute;
+      top: calc(50% + 44px);
+      left: 50%;
+      z-index: 3;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: min(520px, calc(100vw - 48px));
+      padding: 8px 14px;
+      transform: translateX(-50%);
+      border: 1px solid rgba(185, 247, 164, 0.26);
+      background: rgba(2, 6, 4, 0.74);
+      box-shadow: 0 0 22px rgba(0, 0, 0, 0.55);
+      color: var(--ink);
+      font-size: 9px;
+      letter-spacing: 0.14em;
+      line-height: 1.45;
+      text-align: center;
+      text-transform: uppercase;
+      animation: prompt-in 180ms var(--ease-out) both;
+      backdrop-filter: blur(2px);
+      -webkit-backdrop-filter: blur(2px);
+    }
+
+    .hud-prompt[hidden] {
+      display: none;
+    }
+
+    .hud-prompt kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 24px;
+      height: 24px;
+      padding: 0 6px;
+      border: 1px solid rgba(185, 247, 164, 0.5);
+      background: rgba(185, 247, 164, 0.08);
+      color: var(--green-strong);
+      font-family: inherit;
+      font-size: 11px;
+      line-height: 1;
+      box-shadow: 0 0 14px rgba(185, 247, 164, 0.16);
+    }
+
+    .hud-prompt span {
+      white-space: normal;
+    }
+
+    .hud-prompt[data-tone="danger"] {
+      border-color: rgba(255, 90, 78, 0.5);
+      color: #ffd8d3;
+      animation: prompt-in 180ms var(--ease-out) both, prompt-panic 1.1s steps(1) infinite;
+    }
+
+    .hud-prompt[data-tone="danger"] kbd {
+      border-color: rgba(255, 90, 78, 0.6);
+      background: rgba(255, 90, 78, 0.1);
+      color: var(--red);
+      box-shadow: 0 0 16px rgba(255, 90, 78, 0.25);
+    }
+
+    @keyframes prompt-in {
+      from { opacity: 0; transform: translate(-50%, 6px); }
+      to { opacity: 1; transform: translate(-50%, 0); }
+    }
+
+    @keyframes prompt-panic {
+      0%, 88%, 100% { opacity: 1; }
+      89%, 94% { opacity: 0.55; }
+    }
+
+    .hud-listen {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 4px;
+      padding: 4px 8px;
+      border: 1px solid var(--line-soft);
+      color: var(--ink-faint);
+      font-size: 8px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      transition: color 160ms, border-color 160ms;
+    }
+
+    .hud-listen i {
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.7;
+    }
+
+    .hud-listen[data-state="on"] {
+      color: var(--green-dim);
+      border-color: rgba(185, 247, 164, 0.22);
+    }
+
+    .hud-listen[data-state="on"] i {
+      animation: voice-pulse 1.6s ease-in-out infinite;
+    }
+
+    .hud-listen[data-state="warn"] {
+      color: var(--amber);
+      border-color: rgba(255, 191, 105, 0.3);
+    }
+
+    .hud-listen[data-state="error"] {
+      color: var(--red);
+      border-color: rgba(255, 90, 78, 0.4);
+    }
+
+    /* Пассажир проснулся: интерфейс тоже краснеет, но остаётся читаемым. */
+    .hud.is-demon .crosshair span {
+      background: rgba(255, 112, 96, 0.84);
+    }
+
+    .hud.is-demon .hud-listen {
+      border-color: rgba(255, 90, 78, 0.3);
+      color: #ff9387;
+    }
+
+    .hud.is-demon .hud-hints kbd {
+      border-color: rgba(255, 90, 78, 0.4);
+      color: #ff9387;
+    }
+
+    /* На багровом фоне приглушённый зелёный почти исчезает — поднимаем контраст. */
+    .hud.is-demon .hud-kicker,
+    .hud.is-demon .hud-route {
+      color: #e2cec6;
+      text-shadow: 0 1px 10px rgba(0, 0, 0, 0.95);
+    }
+
+    /* ---------- Красная вспышка после пробуждения ---------- */
+
+    .scare-overlay {
+      position: fixed;
+      inset: 0;
+      /* Ниже HUD: пелена не должна съедать подсказки и показания */
+      z-index: 9;
+      pointer-events: none;
+      opacity: 0;
+      background:
+        radial-gradient(ellipse at 50% 50%, transparent 38%, rgba(96, 4, 0, 0.46) 76%, rgba(34, 0, 0, 0.86) 100%);
+      transition: opacity 900ms ease;
+    }
+
+    .scare-overlay.is-active {
+      opacity: 1;
+      animation: scare-breathe 2.6s ease-in-out infinite;
+    }
+
+    .scare-overlay.is-active::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(circle at 50% 58%, rgba(255, 40, 22, 0.1), transparent 46%);
+      animation: scare-rush 3.4s ease-in-out infinite;
+    }
+
+    @keyframes scare-breathe {
+      0%, 100% { filter: saturate(1) brightness(1); }
+      50% { filter: saturate(1.25) brightness(1.11); }
+    }
+
+    @keyframes scare-rush {
+      0%, 100% { opacity: 0.5; transform: scale(1); }
+      50% { opacity: 1; transform: scale(1.06); }
+    }
+
+    .ended-title.is-dead {
+      color: #ff5a4e;
+      text-shadow: 0 0 32px rgba(255, 30, 16, 0.55);
+    }
+
     /* ---------- Pause ---------- */
 
     .pause-screen {
@@ -3360,7 +3539,7 @@
               <span class="kicker">СИСТЕМА БИЛЕТИРОВАНИЯ</span>
               <h2 id="menu-title">ГЛАВНОЕ МЕНЮ</h2>
             </div>
-            <span class="panel-code">СБОРКА<br>0.2.0-П2</span>
+            <span class="panel-code">СБОРКА<br>0.3.0-П3</span>
           </div>
 
           <div class="panel-rule" aria-hidden="true"></div>
@@ -3422,7 +3601,7 @@
           <span>ЕСЛИ ВЫ СЛЫШИТЕ СВОЁ ИМЯ — <b>НЕ ОТВЕЧАЙТЕ</b></span>
         </div>
       </div>
-      <div class="footer-build">СБОРКА <b>0.2</b> // ЧАСТЬ II</div>
+      <div class="footer-build">СБОРКА <b>0.3</b> // ЧАСТЬ III</div>
     </footer>
   </section>
 
@@ -3802,7 +3981,7 @@
         <em>СИГНАЛ ОБОРВАН // 06</em>
       </div>
       <div class="modal-body">
-        <span class="kicker">ЛОББИ БОЛЬШЕ НЕ СУЩЕСТВУЕТ</span>
+        <span class="kicker" id="ended-kicker">ЛОББИ БОЛЬШЕ НЕ СУЩЕСТВУЕТ</span>
         <h2 id="ended-title" class="ended-title">Хост покинул вагон</h2>
         <p class="ended-text" id="ended-text">
           Двери захлопнулись, и голос в рации смолк. Вернитесь в меню и подключитесь к новому лобби.
@@ -3832,6 +4011,10 @@
         <i aria-hidden="true"></i>
         <span id="hud-voice-text">ГОЛОС: ВЫКЛ</span>
       </div>
+      <div class="hud-listen" id="hud-listen" data-state="off">
+        <i aria-hidden="true"></i>
+        <span id="hud-listen-text">МИКРОФОН: ВЫКЛ</span>
+      </div>
     </div>
 
     <div class="crosshair" aria-hidden="true">
@@ -3840,6 +4023,11 @@
       <span class="ch-h"></span>
       <span class="ch-h"></span>
       <span class="ch-dot"></span>
+    </div>
+
+    <div class="hud-prompt" id="hud-prompt" data-tone="normal" hidden>
+      <kbd id="hud-prompt-key">E</kbd>
+      <span id="hud-prompt-text">СХВАТИТЬ ПАССАЖИРА</span>
     </div>
 
     <div class="hud-vitals" id="hud-vitals">
@@ -3865,10 +4053,14 @@
     <div class="hud-hints" id="hud-hints">
       <span><kbd>WASD</kbd> ДВИЖЕНИЕ</span>
       <span><kbd>SHIFT</kbd> БЕГ</span>
+      <span><kbd>E</kbd> СХВАТИТЬ / ТАЩИТЬ</span>
       <span><kbd>V</kbd> РАЦИЯ</span>
       <span><kbd>ESC</kbd> ПАУЗА</span>
     </div>
   </div>
+
+  <!-- Красная пелена: свет в вагоне погас, пассажир больше не человек -->
+  <div class="scare-overlay" id="scare-overlay" aria-hidden="true"></div>
 
   <!-- ==================== ПАУЗА ==================== -->
   <div id="pause-screen" class="pause-screen" hidden>
