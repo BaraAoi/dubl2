@@ -1,5 +1,5 @@
 /* ============================================================================
-   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть IV
+   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть V
    ----------------------------------------------------------------------------
    Единый ES-модуль игры (ванильный JS + Three.js r161 + PeerJS 1.5).
    index.html содержит CSS и DOM; этот файл — вся логика:
@@ -15,12 +15,14 @@
      VoiceChat         — WebRTC-голос, позиционное аудио, «рация»
      PassengerNPC      — сидящий пассажир, позы и «кровавые» материалы
      VoiceWatcher      — распознавание ru-RU и детектор крика
-     DemonDirector     — пробуждение, погоня, захват, переноска и Game Over
+     DemonDirector     — пробуждение, погоня, падение, переноска и сброс с поезда
      TicketInspector   — проверка билетов у четырёх пассажиров
      MissionDirector   — инструктаж и сюжетные цели смены
-     DoorDirector      — переход между вагонами
+     ZoneDirector      — салон → тамбур (буферная зона) → соседний вагон
      BrakeDirector     — тормозной кран как способ спастись
      LobbyDirectory    — каталог открытых лобби в обход ручного кода
+     Inventory         — фонарик, бинт, шокер и верёвка
+     VendingMachine    — торговый автомат в тамбуре
      UIManager         — экраны, HUD, настройки, микрофон
      Game              — сборка и жизненный цикл
    ========================================================================== */
@@ -34,8 +36,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 // =============================================================================
 
 const CONFIG = {
-  version: '0.4.0',
-  part: 4,
+  version: '0.5.0',
+  part: 5,
   car: {
     width: 3.8,          // внутренняя ширина
     length: 32,          // внутренняя длина
@@ -150,7 +152,7 @@ const CONFIG = {
     dragOffset: 0.92,
     dragLerp: 9.5,
     // Сколько секунд тело остаётся обмякшим после захвата.
-    stunTime: 6.0,
+    stunTime: 8.0,
     // Билеты четырёх пассажиров (места в салоне).
     seats: [
       { x: -1.44, z: -4.95, yaw: Math.PI / 2, name: 'ГУСЕВ А. П.', seat: '02', serial: 'А-0441' },
@@ -173,7 +175,26 @@ const CONFIG = {
   mission: {
     interactDistance: 2.7,
     brakeHold: 2.4,
+    // Порог перехода между зонами: тамбур начинается за дверью вагона.
+    vestibuleZ: -16.0,
+    carExitZ: -15.35,
+    vestibuleBackZ: -16.35,
+    vestibuleNextZ: -21.5,
+    vestibuleSpawnZ: -16.85,
+    // Сброс демона за борт: удержание E у ограждения.
+    dumpHold: 1.8,
+    dumpDistance: 2.8,
+    // Даун и бинты.
+    reviveHold: 1.4,
+    bleedout: 70,
   },
+  items: {
+    flashlight: { price: 150, name: 'ФОНАРИК' },
+    bandage: { price: 400, name: 'БИНТ' },
+    taser: { price: 300, name: 'ШОКЕР', charges: 3, recharge: 20, stun: 8 },
+    rope: { price: 220, name: 'ВЕРЁВКА', bonus: 32 },
+  },
+  skins: ['conductor', 'schoolgirl', 'furry', 'tv', 'engineer', 'inspector'],
   speech: {
     lang: 'ru-RU',
     keywords: ['демон', 'бежим', 'шокер', 'шесть пальцев'],
@@ -277,6 +298,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   // откатывается на PeerJS Cloud. 'peerjs' — принудительно старый путь.
   netTransport: 'auto', // 'auto' | 'mqtt' | 'torrent' | 'nostr' | 'peerjs'
   relayCustom: '',
+  // Внешность члена экипажа: тип и цветовой акцент.
+  skin: 'conductor',
+  skinAccent: 0,
   // Антиэхо: приглушать чужой голос, когда ваш микрофон слышит динамики.
   echoGuard: true,
 });
@@ -318,6 +342,12 @@ class SettingsStore {
       }
       if (typeof parsed.relayCustom === 'string') {
         this.values.relayCustom = parsed.relayCustom.slice(0, 160);
+      }
+      if (CONFIG.skins.includes(parsed.skin)) {
+        this.values.skin = parsed.skin;
+      }
+      if (Number.isInteger(parsed.skinAccent)) {
+        this.values.skinAccent = clamp(parsed.skinAccent, 0, 3);
       }
     } catch (error) {
       console.warn('[Settings] Не удалось прочитать localStorage', error);
@@ -1824,7 +1854,8 @@ class TrainCar {
     this.bounds = {
       minX: -this.halfW,
       maxX: this.halfW,
-      minZ: -this.halfL,
+      // Южнее двери — тамбур (буферная зона между вагонами).
+      minZ: -this.halfL - 6.8,
       maxZ: this.halfL,
       minY: 0,
       maxY: height,
@@ -1836,7 +1867,13 @@ class TrainCar {
     this._baseColliders = null;
     this._serviceColliders = [];
     this.variant = 0;
+    this.zone = 'car';
+    this._carBounds = { ...this.bounds };
     this._serviceProps = null;
+    // Дверь в тамбур: створки разъезжаются, когда игрок подходит.
+    this._doorLeafs = null;
+    this._doorSlide = 0;
+    this._doorSlideTarget = 0;
 
     this.swayTargets = [];
     this.dust = null;
@@ -2038,6 +2075,302 @@ class TrainCar {
     this._buildEndDoors();
     this._buildDust();
     this._batchStaticBoxes();
+    // Тамбур строится после батчинга: его детали не сливаются со статикой,
+    // а стена с дверью остаётся коллизией.
+    this._buildVestibule();
+  }
+
+  /**
+   * Тамбур — буферная зона между вагонами. Сюда можно вытащить демона
+   * и сбросить его за борт. Дверь вагона остаётся между зонами.
+   */
+  _buildVestibule() {
+    const group = new THREE.Group();
+    group.name = 'Тамбур';
+    this.group.add(group);
+    this.vestibule = group;
+
+    const m = this.materials;
+    const startZ = -this.halfL;
+    const endZ = -this.halfL - 6.6;
+    const centerZ = (startZ + endZ) / 2;
+    const width = this.halfW * 2;
+
+    const grateMaterial = new THREE.MeshStandardMaterial({
+      color: 0x2a2c27,
+      roughness: 0.92,
+      metalness: 0.35,
+    });
+    const railMaterial = new THREE.MeshStandardMaterial({
+      color: 0x3a3a32,
+      roughness: 0.55,
+      metalness: 0.7,
+    });
+
+    // Пол-решётка.
+    this._box({
+      w: width, h: 0.1, d: Math.abs(endZ - startZ),
+      material: grateMaterial,
+      x: 0, y: -0.02, z: centerZ,
+      parent: group,
+    });
+    for (let i = 0; i <= 14; i += 1) {
+      this._box({
+        w: width - 0.12, h: 0.02, d: 0.05,
+        material: railMaterial,
+        x: 0, y: 0.04, z: startZ - 0.25 - i * 0.46,
+        parent: group,
+      });
+    }
+
+    // Нижние борта и ограждение по бокам; слева оставляем лаз для сброса.
+    for (const side of [-1, 1]) {
+      this._box({
+        w: 0.08, h: 0.9, d: Math.abs(endZ - startZ),
+        material: m.darkMetal,
+        x: side * (this.halfW - 0.04), y: 0.45, z: centerZ,
+        parent: group,
+      });
+      const dumpGap = side < 0;
+      for (let i = 0; i <= 12; i += 1) {
+        const z = startZ - 0.2 - i * 0.5;
+        if (dumpGap && z < -18.4 && z > -20.7) continue;
+        this._box({
+          w: 0.05, h: 1.0, d: 0.05,
+          material: railMaterial,
+          x: side * (this.halfW - 0.06), y: 1.42, z,
+          parent: group,
+        });
+      }
+      // Верхний поручень.
+      for (const [zA, zB] of dumpGap ? [[startZ, -18.4], [-20.7, endZ]] : [[startZ, endZ]]) {
+        this._box({
+          w: 0.06, h: 0.06, d: Math.abs(zB - zA),
+          material: railMaterial,
+          x: side * (this.halfW - 0.06), y: 1.92, z: (zA + zB) / 2,
+          parent: group,
+        });
+      }
+    }
+
+    // Козырёк над входом и торцевая стена с дверью в соседний вагон.
+    this._box({
+      w: width, h: 0.12, d: 2.0,
+      material: m.darkMetal,
+      x: 0, y: 2.56, z: startZ - 1.0,
+      parent: group,
+    });
+    this._box({
+      w: width, h: 2.6, d: 0.14,
+      material: m.trim,
+      x: 0, y: 1.3, z: endZ,
+      parent: group,
+    });
+    this._box({
+      w: 1.02, h: 2.0, d: 0.08,
+      material: new THREE.MeshStandardMaterial({ color: 0x14170f, roughness: 0.9 }),
+      x: 0, y: 1.0, z: endZ + 0.08,
+      parent: group,
+    });
+    // Щель холодного света в двери соседнего вагона.
+    const doorGlow = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.92, 1.9),
+      new THREE.MeshBasicMaterial({ color: 0x1c3b34, transparent: true, opacity: 0.55 }),
+    );
+    doorGlow.position.set(0, 1.0, endZ + 0.14);
+    group.add(doorGlow);
+
+    // Фонарь тамбура и красный аварийный.
+    const lampMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(0.42, 0.1, 0.18),
+      new THREE.MeshStandardMaterial({ color: 0xffe6b0, emissive: 0xffc978, emissiveIntensity: 2.2 }),
+    );
+    lampMesh.position.set(0, 2.44, startZ - 1.1);
+    group.add(lampMesh);
+    const lamp = new THREE.PointLight(0xffcf8c, 34, 13, 2);
+    lamp.position.set(0, 2.3, startZ - 1.2);
+    group.add(lamp);
+    this.vestibuleLight = lamp;
+
+    // Плафон над серединой тамбура: раньше здесь была чёрная дыра.
+    // Потолок тамбура: без него над головой чернота.
+    this._box({
+      w: width + 0.2, h: 0.08, d: Math.abs(endZ - startZ) + 0.2,
+      material: m.ceiling || m.darkMetal,
+      x: 0, y: 2.9, z: centerZ,
+      parent: group,
+    });
+    for (let i = 0; i < 7; i += 1) {
+      this._box({
+        w: 0.1, h: 0.06, d: Math.abs(endZ - startZ),
+        material: railMaterial,
+        x: -this.halfW + 0.35 + i * 0.52, y: 2.84, z: centerZ,
+        parent: group,
+      });
+    }
+
+    const midLampMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(0.4, 0.09, 0.16),
+      new THREE.MeshStandardMaterial({ color: 0xffe6b0, emissive: 0xffc978, emissiveIntensity: 2 }),
+    );
+    midLampMesh.position.set(0, 2.44, -18.0);
+    group.add(midLampMesh);
+    const midLamp = new THREE.PointLight(0xffcf8c, 26, 11, 2);
+    midLamp.position.set(0, 2.28, -18.0);
+    group.add(midLamp);
+    this.vestibuleMidLight = midLamp;
+
+    // Второй плафон у лаза: без него борт для сброса тонет в темноте.
+    const gapLamp = new THREE.PointLight(0xffb070, 22, 9, 2);
+    gapLamp.position.set(-0.8, 2.05, -19.6);
+    group.add(gapLamp);
+    this.vestibuleGapLight = gapLamp;
+
+    // Ночь за бортом: в лазе не должно быть чёрной пустоты.
+    // Берём ту же текстуру, что и в окнах, но растягиваем её на панораму.
+    const nightMap = m.window.map.clone();
+    nightMap.needsUpdate = true;
+    nightMap.wrapS = THREE.RepeatWrapping;
+    nightMap.wrapT = THREE.RepeatWrapping;
+    nightMap.repeat.set(5, 2.4);
+    const nightBackdrop = new THREE.Mesh(
+      new THREE.PlaneGeometry(22, 10),
+      new THREE.MeshBasicMaterial({ map: nightMap, color: 0x8195a3, fog: true }),
+    );
+    nightBackdrop.rotation.y = Math.PI / 2;
+    nightBackdrop.position.set(-6.8, 2.2, -19.55);
+    nightBackdrop.name = 'Ночь за бортом';
+    group.add(nightBackdrop);
+
+    const redLamp = new THREE.Mesh(
+      new THREE.SphereGeometry(0.09, 10, 8),
+      new THREE.MeshStandardMaterial({ color: 0x5a0d08, emissive: 0xff2a12, emissiveIntensity: 2.6 }),
+    );
+    redLamp.position.set(0.95, 2.32, endZ + 0.5);
+    group.add(redLamp);
+
+    // Табличка «ВЫХОД К СОСЕДНЕМУ ВАГОНУ».
+    const signCanvas = document.createElement('canvas');
+    signCanvas.width = 512;
+    signCanvas.height = 128;
+    const ctx = signCanvas.getContext('2d');
+    ctx.fillStyle = '#0d1109';
+    ctx.fillRect(0, 0, 512, 128);
+    ctx.strokeStyle = '#b9f7a4';
+    ctx.lineWidth = 5;
+    ctx.strokeRect(6, 6, 500, 116);
+    ctx.fillStyle = '#d6f4c8';
+    ctx.font = '600 46px "Cascadia Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('СОСЕДНИЙ ВАГОН', 256, 52);
+    ctx.fillStyle = '#8fbf85';
+    ctx.font = '500 30px "Cascadia Mono", monospace';
+    ctx.fillText('ТАМБУР // БУФЕРНАЯ ЗОНА', 256, 96);
+    const signTexture = new THREE.CanvasTexture(signCanvas);
+    signTexture.colorSpace = THREE.SRGBColorSpace;
+    const sign = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.5, 0.38),
+      new THREE.MeshStandardMaterial({
+        map: signTexture,
+        emissive: 0xffffff,
+        emissiveMap: signTexture,
+        emissiveIntensity: 0.5,
+        roughness: 0.8,
+      }),
+    );
+    // Над дверным проёмом: ниже табличку срезала перекладина двери.
+    sign.position.set(0, 2.43, endZ + 0.12);
+    group.add(sign);
+
+    // Разметка на полу: куда идти.
+    const arrow = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.5, 1.4),
+      new THREE.MeshBasicMaterial({ color: 0xb9f7a4, transparent: true, opacity: 0.2 }),
+    );
+    arrow.rotation.x = -Math.PI / 2;
+    arrow.position.set(0, 0.06, -20.2);
+    group.add(arrow);
+
+    // Опасная зона у лаза: жёлто-чёрная разметка и красный фонарь.
+    const hazardCanvas = document.createElement('canvas');
+    hazardCanvas.width = 256;
+    hazardCanvas.height = 64;
+    const hctx = hazardCanvas.getContext('2d');
+    hctx.fillStyle = '#1a1508';
+    hctx.fillRect(0, 0, 256, 64);
+    for (let i = -2; i < 10; i += 1) {
+      hctx.fillStyle = i % 2 === 0 ? '#d8b23c' : '#231c0a';
+      hctx.save();
+      hctx.translate(i * 32, 0);
+      hctx.rotate(-0.4);
+      hctx.fillRect(0, -30, 18, 130);
+      hctx.restore();
+    }
+    const hazardTexture = new THREE.CanvasTexture(hazardCanvas);
+    hazardTexture.colorSpace = THREE.SRGBColorSpace;
+    hazardTexture.wrapS = THREE.RepeatWrapping;
+    hazardTexture.wrapT = THREE.RepeatWrapping;
+    hazardTexture.repeat.set(1, 4);
+    const hazard = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.5, 2.25),
+      new THREE.MeshBasicMaterial({ map: hazardTexture, transparent: true, opacity: 0.8 }),
+    );
+    hazard.rotation.set(-Math.PI / 2, 0, 0);
+    hazard.position.set(-1.34, 0.055, -19.55);
+    group.add(hazard);
+
+    const dumpSignCanvas = document.createElement('canvas');
+    dumpSignCanvas.width = 384;
+    dumpSignCanvas.height = 128;
+    const dctx = dumpSignCanvas.getContext('2d');
+    dctx.fillStyle = '#1a0806';
+    dctx.fillRect(0, 0, 384, 128);
+    dctx.strokeStyle = '#ff6a4a';
+    dctx.lineWidth = 5;
+    dctx.strokeRect(6, 6, 372, 116);
+    dctx.fillStyle = '#ffc0b0';
+    dctx.font = '600 44px "Cascadia Mono", monospace';
+    dctx.textAlign = 'center';
+    dctx.textBaseline = 'middle';
+    dctx.fillText('СБРОС', 192, 50);
+    dctx.fillStyle = '#c98a78';
+    dctx.font = '500 26px "Cascadia Mono", monospace';
+    dctx.fillText('ДЕРЖИТЕ E У БОРТА', 192, 96);
+    const dumpSignTexture = new THREE.CanvasTexture(dumpSignCanvas);
+    dumpSignTexture.colorSpace = THREE.SRGBColorSpace;
+    const dumpSign = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.74, 0.26),
+      new THREE.MeshStandardMaterial({
+        map: dumpSignTexture,
+        emissive: 0xffffff,
+        emissiveMap: dumpSignTexture,
+        emissiveIntensity: 0.6,
+        roughness: 0.7,
+        side: THREE.DoubleSide,
+      }),
+    );
+    dumpSign.rotation.y = Math.PI / 2;
+    // Выше уровня глаз: вплотную к ограждению табличка не должна
+    // занимать весь экран — сброс показывает подсказка в центре.
+    dumpSign.position.set(-1.68, 2.26, -19.5);
+    group.add(dumpSign);
+
+    const gapBulb = new THREE.Mesh(
+      new THREE.SphereGeometry(0.075, 10, 8),
+      new THREE.MeshStandardMaterial({ color: 0x3a0a06, emissive: 0xff3a1c, emissiveIntensity: 2.8 }),
+    );
+    gapBulb.position.set(-1.62, 2.12, -19.55);
+    group.add(gapBulb);
+    this.vestibuleGapLamp = gapBulb;
+
+    this.vestibuleColliders = [
+      // Стена вагона: проход только через дверь-переход (телепорт).
+      { minX: -this.halfW, maxX: this.halfW, minZ: -this.halfL - 0.35, maxZ: -this.halfL + 0.05, type: 'wall' },
+      // Торцевая стена.
+      { minX: -this.halfW, maxX: this.halfW, minZ: endZ - 0.2, maxZ: endZ + 0.1, type: 'wall' },
+    ];
+    this.colliders.push(...this.vestibuleColliders);
   }
 
   /**
@@ -2965,8 +3298,14 @@ class TrainCar {
     group.name = direction < 0 ? 'Дверь тамбура' : 'Дверь вагона';
     this.group.add(group);
 
-    // Дверное полотно из двух створок.
+    // Дверное полотно из двух створок. Створки — отдельные группы,
+    // чтобы дверь в тамбур могла разъехаться перед игроком.
+    const leafs = [];
     for (const x of [-0.3, 0.3]) {
+      const leaf = new THREE.Group();
+      leaf.position.x = 0;
+      group.add(leaf);
+      leafs.push({ leaf, side: Math.sign(x) });
       this._box({
         w: 0.58,
         h: 2.08,
@@ -2975,7 +3314,7 @@ class TrainCar {
         x,
         y: 1.06,
         z: 0.035,
-        parent: group,
+        parent: leaf,
         cast: true,
       });
       this._box({
@@ -2986,7 +3325,7 @@ class TrainCar {
         x,
         y: 0.44,
         z: 0.05,
-        parent: group,
+        parent: leaf,
       });
       this._box({
         w: 0.5,
@@ -2996,7 +3335,7 @@ class TrainCar {
         x,
         y: 1.98,
         z: 0.05,
-        parent: group,
+        parent: leaf,
       });
       this._box({
         w: 0.24,
@@ -3006,7 +3345,7 @@ class TrainCar {
         x,
         y: 1.32,
         z: 0.07,
-        parent: group,
+        parent: leaf,
       });
       // Продольные рёбра створки.
       for (const rx of [-0.17, 0.17]) {
@@ -3018,8 +3357,58 @@ class TrainCar {
           x: x + rx,
           y: 1.12,
           z: 0.075,
-          parent: group,
+          parent: leaf,
         });
+      }
+    }
+    if (direction < 0) {
+      this._doorLeafs = leafs;
+      this._doorSlide = 0;
+      this._doorSlideTarget = 0;
+
+      // Табличка над дверью: игрок должен видеть, куда идти, даже в темноте.
+      const signCanvas = document.createElement('canvas');
+      signCanvas.width = 512;
+      signCanvas.height = 144;
+      const sctx = signCanvas.getContext('2d');
+      sctx.fillStyle = 'rgba(4, 10, 6, 0.94)';
+      sctx.fillRect(0, 0, 512, 144);
+      sctx.strokeStyle = 'rgba(185, 247, 164, 0.62)';
+      sctx.lineWidth = 4;
+      sctx.strokeRect(6, 6, 500, 132);
+      sctx.textAlign = 'center';
+      sctx.textBaseline = 'middle';
+      sctx.fillStyle = '#d9ffcb';
+      sctx.font = '600 56px "Cascadia Mono", "Courier New", monospace';
+      sctx.fillText('ТАМБУР', 236, 52);
+      sctx.fillStyle = '#b9f7a4';
+      sctx.font = '500 28px "Cascadia Mono", "Courier New", monospace';
+      sctx.fillText('АВТОМАТ · СБРОС', 236, 106);
+      sctx.strokeStyle = '#b9f7a4';
+      sctx.lineWidth = 7;
+      sctx.beginPath();
+      sctx.moveTo(432, 52);
+      sctx.lineTo(474, 72);
+      sctx.lineTo(432, 92);
+      sctx.stroke();
+      const signTexture = new THREE.CanvasTexture(signCanvas);
+      signTexture.colorSpace = THREE.SRGBColorSpace;
+      const sign = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.98, 0.275),
+        new THREE.MeshBasicMaterial({ map: signTexture, transparent: true, toneMapped: false }),
+      );
+      sign.position.set(0, 2.62, 0.12);
+      group.add(sign);
+
+      // Зелёные маркеры на полу ведут к двери.
+      const markerMaterial = new THREE.MeshBasicMaterial({ color: 0x9be3dc, transparent: true, opacity: 0.34 });
+      for (const z of [-12.2, -13.4, -14.6]) {
+        for (const x of [-1.55, 1.55]) {
+          const marker = new THREE.Mesh(new THREE.PlaneGeometry(0.1, 0.34), markerMaterial);
+          marker.rotation.x = -Math.PI / 2;
+          marker.position.set(x, 0.045, z);
+          this.group.add(marker);
+        }
       }
     }
 
@@ -3250,6 +3639,7 @@ class TrainCar {
   }
 
   update(dt, elapsed) {
+    this._updateDoor(dt);
     // Мерцание главной лампы.
     if (this.reducedMotion) {
       this._flickerValue = 0.97;
@@ -3354,6 +3744,58 @@ class TrainCar {
    * Логический вагон: 0 — пассажирский, 1 — служебный.
    * Служебный: скамьи убраны, вдоль стен ящики и мешки, свет приглушён.
    */
+  /**
+   * Игровая зона: 'car' — салон/соседний вагон, 'vestibule' — тамбур.
+   *
+   * Раньше границы мира оставались [-15, 15] и после перехода в тамбур
+   * (z ≈ −17) игрок оказывался вне bounds: _isBlocked() возвращал true
+   * для любого шага, и из тамбура было невозможно выйти. Теперь границы
+   * и коллизии переключаются вместе с зоной.
+   */
+  setZone(zone) {
+    const next = zone === 'vestibule' ? 'vestibule' : 'car';
+    if (this.zone === next) return;
+    this.zone = next;
+    if (next === 'vestibule') {
+      const endZ = -this.halfL - 6.6;
+      this.bounds = {
+        minX: -this.halfW + 0.24,
+        maxX: this.halfW - 0.24,
+        minZ: endZ + 0.22,
+        maxZ: -this.halfL - 0.3,
+        minY: 0,
+        maxY: this.height,
+      };
+      this.colliders = (this.vestibuleColliders || []).slice();
+    } else {
+      this.bounds = { ...this._carBounds };
+      if (!this._baseColliders) this._baseColliders = this.colliders.slice();
+      this.colliders = this.variant === 1
+        ? this._baseColliders.concat(this._serviceColliders)
+        : this._baseColliders.slice();
+    }
+    if (this.renderer) this.renderer.shadowMap.needsUpdate = true;
+  }
+
+  /** 0 — створки закрыты, 1 — разъехались. */
+  setDoorOpen(on) {
+    this._doorSlideTarget = on ? 1 : 0;
+  }
+
+  _updateDoor(dt) {
+    const target = this._doorSlideTarget || 0;
+    const next = damp(this._doorSlide, target, 9, dt);
+    if (Math.abs(next - this._doorSlide) < 0.0005) {
+      this._doorSlide = target;
+    } else {
+      this._doorSlide = next;
+    }
+    if (!this._doorLeafs) return;
+    for (const entry of this._doorLeafs) {
+      entry.leaf.position.x = entry.side * 0.64 * this._doorSlide;
+    }
+  }
+
   setCarVariant(index) {
     const next = index === 1 ? 1 : 0;
     if (this.variant === next) return;
@@ -3504,6 +3946,9 @@ class PlayerController {
     this.enabled = false;
     // Волочение тела и прочие эффекты масштабируют скорость, не трогая настройки.
     this.speedScale = 1;
+    // Упавший игрок лежит: камера у пола, движение выключено.
+    this.downed = false;
+    this._standEyeHeight = CONFIG.player.eyeHeight;
     // E — взаимодействие с пассажиром: нажатие и удержание.
     this.interactHeld = false;
     this.stamina = CONFIG.player.staminaMax;
@@ -3580,6 +4025,30 @@ class PlayerController {
     this.camera.rotation.set(0, 0, 0, 'YXZ');
     this._syncCamera(0);
     this._emitStamina(true);
+  }
+
+  /** Падение: камера падает на пол, движение и предметы недоступны. */
+  setDowned(on) {
+    const next = Boolean(on);
+    if (this.downed === next) return;
+    this.downed = next;
+    this.eyeHeight = next ? 0.34 : this._standEyeHeight;
+    this.velocity.set(0, 0, 0);
+    this.keys.clear();
+    this._releaseInteract();
+    if (next) {
+      this.sprinting = false;
+      this.bus.emit('player:interact', { held: false });
+    }
+    this._syncCamera(0);
+  }
+
+  /** Развернуть взгляд (после переноса через дверь). */
+  setYaw(yaw) {
+    const next = Number(yaw);
+    if (!Number.isFinite(next)) return;
+    this.camera.rotation.set(this.camera.rotation.x, next, 0, 'YXZ');
+    this._syncCamera(0);
   }
 
   setEnabled(enabled) {
@@ -3715,6 +4184,15 @@ class PlayerController {
   update(dt, elapsed) {
     if (!this.enabled) return;
 
+    if (this.downed) {
+      // Лежим: смотрим по сторонам, но не двигаемся.
+      this.velocity.set(0, 0, 0);
+      this.stamina = Math.min(CONFIG.player.staminaMax, this.stamina + CONFIG.player.staminaRegen * dt);
+      this._syncCamera(elapsed);
+      this._emitStamina(false);
+      return;
+    }
+
     const { forward, right } = this._inputAxes();
     const wish = this._wishDirection(forward, right);
     const moving = wish.lengthSq() > 0.001;
@@ -3821,6 +4299,8 @@ class PlayerController {
       this.feetY + this.eyeHeight + bob + idleSway + rumbleY,
       this.position.z,
     );
+    if (this.downed) this.camera.rotation.z = 0.62;
+    else if (this.camera.rotation.z) this.camera.rotation.z = 0;
   }
 
   _emitStamina(force) {
@@ -5673,6 +6153,110 @@ class NetworkManager {
   }
 }
 
+/**
+ * Набор деталей для сборки члена экипажа.
+ *
+ * Общая база (торс, голова, руки, ноги) одна, скины добавляют характер:
+ * китель, матроску, мех, корпус телевизора или кожаное пальто. Так экипаж
+ * выглядит как пассажиры в салоне, а не как набор капсул.
+ */
+function kit_headMat(kit, palette) {
+  return kit._mat(palette.head, { roughness: 0.75, emissive: new THREE.Color(palette.head).multiplyScalar(0.3).getHex(), emissiveIntensity: 0.7 });
+}
+
+class CrewKit {
+  static create(owner, model, look, accent) {
+    return new CrewKit(owner, model, look, accent);
+  }
+
+  static PALETTE = {
+    conductor: { coat: 0x46553c, sleeve: 0x2c3726, trim: 0x1b2118, legs: 0x262b23, head: 0xd8bb9b, build: 1.02 },
+    schoolgirl: { coat: 0x39466e, sleeve: 0x27304d, trim: 0xf4f6fa, legs: 0x232941, head: 0xf0d2b5, build: 0.88 },
+    furry: { coat: 0xb47d47, sleeve: 0x8d5f34, trim: 0xe8d4b4, legs: 0x6b4a2e, head: 0xb47d47, build: 1.0 },
+    tv: { coat: 0x3d4457, sleeve: 0x2a3040, trim: 0x191d26, legs: 0x22262f, head: 0xb4b4b4, build: 0.98 },
+    engineer: { coat: 0x49637a, sleeve: 0x33475a, trim: 0x263140, legs: 0x36485a, head: 0xc99d78, build: 1.05 },
+    inspector: { coat: 0x3d3024, sleeve: 0x2b2118, trim: 0x1c1611, legs: 0x201a15, head: 0xded3c2, build: 0.96 },
+  };
+
+  constructor(owner, model, look, accent) {
+    this.owner = owner;
+    this.model = model;
+    this.look = look;
+    this.accent = accent;
+    this.shoulders = [];
+    this.legs = [];
+    this.materials = [];
+
+    const palette = CrewKit.PALETTE[look.skin] || CrewKit.PALETTE.conductor;
+    this.palette = palette;
+    this.headColor = palette.head;
+    this.legsColor = palette.legs;
+    this.build = (look.build || 1) * (palette.build || 1);
+    this.front = null;
+
+    const cache = new Map();
+    // В вагоне темно, поэтому у каждой ткани есть чуть-чуть собственного
+    // свечения: иначе лица и детали формы читаются как чёрные пятна.
+    const selfLit = (color) => new THREE.Color(color).multiplyScalar(0.22).getHex();
+    this._mat = (color, opts = {}) => {
+      const key = `${color}|${opts.roughness ?? 0.9}|${opts.metalness ?? 0.05}|${opts.emissive ?? 0}|${opts.emissiveIntensity ?? 0}|${opts.side ?? 0}`;
+      if (cache.has(key)) return cache.get(key);
+      const emissive = opts.emissive ?? selfLit(color);
+      const material = new THREE.MeshStandardMaterial({
+        color,
+        roughness: opts.roughness ?? 0.9,
+        metalness: opts.metalness ?? 0.05,
+        emissive,
+        emissiveIntensity: opts.emissiveIntensity ?? 0.55,
+        side: opts.side ?? THREE.FrontSide,
+      });
+      cache.set(key, material);
+      this.materials.push(material);
+      return material;
+    };
+    this.mat = this._mat;
+
+    this.add = (geometry, material, parent, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0) => {
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(x, y, z);
+      mesh.rotation.set(rx, ry, rz);
+      parent.add(mesh);
+      return mesh;
+    };
+
+    // Основа: узкий торс-«пальто» с плечами. Всё декоративное лежит на
+    // поверхности (z ≈ 0.12…0.2), поэтому матроска, ремни и экран видны.
+    const body = new THREE.Group();
+    body.position.y = 0.82;
+    model.add(body);
+    this.body = body;
+
+    this.torsoMat = this._mat(palette.coat, { emissive: 0x141c14, emissiveIntensity: 0.4 });
+    const torso = this.add(new THREE.BoxGeometry(0.36 * this.build, 0.5, 0.23), this.torsoMat, body, 0, 0.14, 0);
+    torso.scale.set(1, 1, 1);
+    // Скруглённые бока: не даёт силуэту стать «доской».
+    this.add(new THREE.CapsuleGeometry(0.12 * this.build, 0.34, 3, 10), this.torsoMat, body, 0, 0.16, 0);
+    this.add(new THREE.BoxGeometry(0.46 * this.build, 0.1, 0.25), this.torsoMat, body, 0, 0.42, 0);
+    this.add(new THREE.BoxGeometry(0.4 * this.build, 0.1, 0.22), this.torsoMat, body, 0, -0.12, 0);
+
+    // Шея и голова-заготовка; детали лица и причёску добавляют скины.
+    this.add(new THREE.CylinderGeometry(0.056, 0.062, 0.08, 10), kit_headMat(this, palette), body, 0, 0.55, 0);
+    this.headGroup = new THREE.Group();
+    this.headGroup.position.y = 0.58;
+    this.headGroup.scale.setScalar(1.16);
+    body.add(this.headGroup);
+
+    // Невидимая метка «лицо»: по ней тесты и отладка понимают, куда смотрит
+    // модель. Все скины обязаны держать её в +Z.
+    const frontMarker = new THREE.Object3D();
+    frontMarker.position.set(0, 1.06, 0.26);
+    frontMarker.name = 'лицо';
+    model.add(frontMarker);
+    this.frontMarker = frontMarker;
+    this.front = frontMarker;
+  }
+}
+
 // =============================================================================
 // УДАЛЁННЫЕ ИГРОКИ
 // =============================================================================
@@ -5745,10 +6329,13 @@ class RemotePlayers {
     const look = looks[hash % looks.length];
     return {
       ...look,
-      height: 0.94 + ((hash >>> 8) % 13) / 100,
-      build: 0.9 + ((hash >>> 16) % 21) / 100,
+      height: 0.96 + ((hash >>> 8) % 11) / 100,
+      build: 0.92 + ((hash >>> 16) % 19) / 100,
     };
   }
+
+  static ACCENTS = [0x9be3dc, 0xb9f7a4, 0xff6a4a, 0xc9a0ff];
+  static SKINS = ['conductor', 'schoolgirl', 'furry', 'tv', 'engineer', 'inspector'];
 
   _createAvatar(player) {
     const group = new THREE.Group();
@@ -5757,192 +6344,17 @@ class RemotePlayers {
     this._group.add(group);
 
     const look = RemotePlayers._crewLook(player.id, player.name);
-    const scale = look.height;
-    group.scale.setScalar(scale);
-
-    const coatMaterial = new THREE.MeshStandardMaterial({
-      color: look.coat,
-      roughness: 0.92,
-      metalness: 0.05,
-      emissive: 0x18251c,
-      emissiveIntensity: 0.5,
-    });
-    const trimMaterial = new THREE.MeshStandardMaterial({ color: look.trim, roughness: 0.85, metalness: 0.15 });
-    const skinMaterial = new THREE.MeshStandardMaterial({ color: look.skin, roughness: 0.72 });
-    const scarfMaterial = new THREE.MeshStandardMaterial({ color: look.scarf, roughness: 0.95 });
-    const darkMaterial = new THREE.MeshStandardMaterial({ color: 0x1b1c19, roughness: 0.86 });
-    const gearMaterial = new THREE.MeshStandardMaterial({
-      color: 0x2c2a22,
-      roughness: 0.7,
-      metalness: 0.45,
-    });
-
-    const body = new THREE.Group();
-    body.position.y = 0.82;
-    group.add(body);
-
-    // Пальто: сужается к поясу, полы расходятся.
-    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.25 * look.build, 0.5, 4, 12), coatMaterial);
-    torso.scale.set(1.1, 1, 0.78);
-    torso.position.y = 0.16;
-    body.add(torso);
-
-    const collar = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.05, 8, 16), scarfMaterial);
-    collar.rotation.x = Math.PI / 2;
-    collar.position.y = 0.44;
-    body.add(collar);
-
-    const coatTails = new THREE.Mesh(new THREE.BoxGeometry(0.44 * look.build, 0.34, 0.2), coatMaterial);
-    coatTails.position.set(0, -0.28, -0.12);
-    coatTails.rotation.x = -0.08;
-    body.add(coatTails);
-
-    // Ремень и бляха.
-    const belt = new THREE.Mesh(new THREE.BoxGeometry(0.46 * look.build, 0.05, 0.3), darkMaterial);
-    belt.position.y = -0.1;
-    body.add(belt);
-    const buckle = new THREE.Mesh(
-      new THREE.BoxGeometry(0.06, 0.045, 0.02),
-      new THREE.MeshStandardMaterial({ color: 0x8a7a48, roughness: 0.4, metalness: 0.8 }),
-    );
-    buckle.position.set(0, -0.1, 0.155);
-    body.add(buckle);
-
-    // Руки — вдоль тела, с манжетами.
-    for (const side of [-1, 1]) {
-      const shoulder = new THREE.Group();
-      shoulder.position.set(side * 0.28 * look.build, 0.3, 0);
-      body.add(shoulder);
-      const upper = new THREE.Mesh(new THREE.CapsuleGeometry(0.062, 0.24, 3, 8), coatMaterial);
-      upper.position.y = -0.14;
-      shoulder.add(upper);
-      const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.072, 0.072, 0.05, 10), trimMaterial);
-      cuff.position.y = -0.28;
-      shoulder.add(cuff);
-      const hand = new THREE.Mesh(new THREE.SphereGeometry(0.055, 9, 7), skinMaterial);
-      hand.position.y = -0.33;
-      shoulder.add(hand);
-      shoulder.rotation.z = side * -0.08;
-    }
-
-    // Ноги и ботинки.
-    for (const side of [-1, 1]) {
-      const leg = new THREE.Group();
-      leg.position.set(side * 0.11, 0.62, 0);
-      group.add(leg);
-      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.5, 3, 8), darkMaterial);
-      thigh.position.y = -0.28;
-      leg.add(thigh);
-      const boot = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.09, 0.24), gearMaterial);
-      boot.position.set(0, -0.58, 0.04);
-      leg.add(boot);
-    }
-
-    // Голова и лицо.
-    const head = new THREE.Group();
-    head.position.y = 0.6;
-    body.add(head);
-    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.135, 16, 12), skinMaterial);
-    skull.scale.set(0.94, 1.05, 1);
-    head.add(skull);
-    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.028, 0.07, 6), skinMaterial);
-    nose.rotation.x = Math.PI / 2;
-    nose.position.set(0, -0.01, 0.13);
-    head.add(nose);
-
-    // Глаза светятся слабо — в темноте видно, что это человек, а не капсула.
-    const eyeMaterial = new THREE.MeshStandardMaterial({
-      color: 0x1a1a14,
-      emissive: 0xd8c88a,
-      emissiveIntensity: 0.45,
-      roughness: 0.3,
-    });
-    for (const side of [-1, 1]) {
-      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.022, 8, 6), eyeMaterial);
-      eye.position.set(side * 0.05, 0.025, 0.122);
-      head.add(eye);
-    }
-
-    // Шапка: вариантов четыре, чтобы экипаж не выглядел близнецами.
-    if (look.hat === 'cap') {
-      const crown = new THREE.Mesh(new THREE.CylinderGeometry(0.142, 0.142, 0.08, 14), trimMaterial);
-      crown.position.y = 0.1;
-      head.add(crown);
-      const brim = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.018, 0.16), darkMaterial);
-      brim.position.set(0, 0.07, 0.12);
-      head.add(brim);
-    } else if (look.hat === 'beanie') {
-      const cap = new THREE.Mesh(new THREE.SphereGeometry(0.145, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.55), scarfMaterial);
-      cap.position.y = 0.055;
-      head.add(cap);
-      const fold = new THREE.Mesh(new THREE.TorusGeometry(0.138, 0.022, 8, 18), scarfMaterial);
-      fold.rotation.x = Math.PI / 2;
-      fold.position.y = 0.06;
-      head.add(fold);
-    } else if (look.hat === 'hood') {
-      const hood = new THREE.Mesh(
-        new THREE.SphereGeometry(0.19, 14, 12, 0, Math.PI * 2, 0, Math.PI * 0.62),
-        coatMaterial,
-      );
-      hood.position.set(0, 0.04, -0.03);
-      hood.rotation.x = -0.18;
-      head.add(hood);
-    } else {
-      const hair = new THREE.Mesh(
-        new THREE.SphereGeometry(0.14, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.5),
-        darkMaterial,
-      );
-      hair.position.y = 0.045;
-      head.add(hair);
-    }
-
-    // Снаряжение: фонарь, сумка или рация.
-    if (look.gear === 'lantern') {
-      const lantern = new THREE.Group();
-      lantern.position.set(0.24 * look.build, -0.16, 0.1);
-      body.add(lantern);
-      const housing = new THREE.Mesh(new THREE.CylinderGeometry(0.042, 0.05, 0.11, 10), gearMaterial);
-      lantern.add(housing);
-      const bulb = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.036, 0.036, 0.055, 10),
-        new THREE.MeshStandardMaterial({ color: 0xffe1a0, emissive: 0xffc169, emissiveIntensity: 2.2 }),
-      );
-      lantern.add(bulb);
-    } else if (look.gear === 'satchel') {
-      const strap = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.5, 0.02), darkMaterial);
-      strap.position.set(-0.12, 0.16, 0.155);
-      strap.rotation.z = 0.42;
-      body.add(strap);
-      const bag = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.18, 0.1), gearMaterial);
-      bag.position.set(0.16, -0.16, 0.13);
-      bag.rotation.z = -0.06;
-      body.add(bag);
-    } else {
-      const radio = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.14, 0.05), gearMaterial);
-      radio.position.set(-0.19 * look.build, 0.16, 0.14);
-      body.add(radio);
-      const antenna = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.16, 5), gearMaterial);
-      antenna.position.set(-0.19 * look.build, 0.31, 0.14);
-      body.add(antenna);
-    }
-
-    // Нагрудный фонарик: по нему читается «кто говорит».
-    const visorMaterial = new THREE.MeshStandardMaterial({
-      color: 0x0a1410,
-      emissive: 0x9be3dc,
-      emissiveIntensity: 1.5,
-      roughness: 0.4,
-    });
-    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.03, 0.02), visorMaterial);
-    visor.position.set(0, 0.26, 0.19);
-    body.add(visor);
-
-    body.traverse((object) => {
-      if (object.isMesh) object.castShadow = false;
-    });
+    const skin = player.skin || 'conductor';
+    const accent = Number.isInteger(player.accent) ? player.accent : 0;
+    const model = new THREE.Group();
+    // Модель собрана лицом в +Z, а сетевой yaw считает вперёд по −Z.
+    model.rotation.y = Math.PI;
+    group.add(model);
+    const parts = this._buildCrewModel(model, skin, accent, look);
+    group.scale.setScalar(look.height);
 
     const ringMaterial = new THREE.MeshBasicMaterial({
-      color: 0x9be3dc,
+      color: RemotePlayers.ACCENTS[accent] || RemotePlayers.ACCENTS[0],
       transparent: true,
       opacity: 0.22,
       blending: THREE.AdditiveBlending,
@@ -5964,7 +6376,7 @@ class RemotePlayers {
     });
     const tag = new THREE.Sprite(tagMaterial);
     tag.scale.set(1.5, 0.42, 1);
-    tag.position.y = 2.18 * scale;
+    tag.position.y = 2.18 * look.height;
     group.add(tag);
 
     const avatar = {
@@ -5972,10 +6384,12 @@ class RemotePlayers {
       player,
       name: player.name,
       group,
-      body,
-      bodyMaterial: coatMaterial,
-      visor,
-      visorMaterial,
+      model,
+      parts,
+      body: parts.body,
+      bodyMaterial: parts.bodyMaterial,
+      visor: parts.visor,
+      visorMaterial: parts.visorMaterial,
       ring,
       ringMaterial,
       tag,
@@ -5983,14 +6397,642 @@ class RemotePlayers {
       samples: [],
       speaking: false,
       stale: false,
+      downed: false,
       inCar: false,
       lastTagState: '',
       hasState: false,
       look,
+      skin,
+      accent,
+      kit: parts.kit,
     };
 
     if (this.voice) this.voice.attachAvatar(player.id, group);
     return avatar;
+  }
+
+  /**
+   * Модель члена экипажа — как пассажиры в салоне, только по пояс заметнее
+   * и с характером. Все модели собираются лицом в +Z, а группа разворачивается
+   * на π: сетевой yaw считает «вперёд» по −Z, поэтому так никто не идёт спиной.
+   */
+  _buildCrewModel(model, skin, accentIndex, look) {
+    const accent = RemotePlayers.ACCENTS[accentIndex] || RemotePlayers.ACCENTS[0];
+    const kit = CrewKit.create(this, model, { ...look, skin }, accent);
+    const { add, body, mat } = kit;
+    const torsoMat = kit.torsoMat;
+
+    if (skin === 'schoolgirl') this._skinSchoolgirl(kit);
+    else if (skin === 'furry') this._skinFurry(kit);
+    else if (skin === 'tv') this._skinTv(kit);
+    else if (skin === 'engineer') this._skinEngineer(kit);
+    else if (skin === 'inspector') this._skinInspector(kit);
+    else this._skinConductor(kit);
+
+    // Руки: у фури лапы, у телевизора перчатки, у остальных кисти.
+    const paw = skin === 'furry';
+    const glove = skin === 'tv' ? mat(0xcfcfcf, { roughness: 0.55 }) : null;
+    const sleeveMat = mat(kit.palette.sleeve, { roughness: 0.94 });
+    for (const side of [-1, 1]) {
+      const shoulder = new THREE.Group();
+      shoulder.position.set(side * 0.265 * kit.build, 0.4, 0);
+      body.add(shoulder);
+      add(new THREE.CapsuleGeometry(paw ? 0.075 : 0.056, 0.42, 3, 8), sleeveMat, shoulder, 0, -0.24, 0);
+      if (paw) {
+        add(new THREE.SphereGeometry(0.078, 10, 8), mat(kit.headColor, { roughness: 0.99 }), shoulder, 0, -0.47, 0.02);
+        for (let f = 0; f < 3; f += 1) {
+          add(new THREE.CapsuleGeometry(0.013, 0.045, 2, 5), mat(0x1b1512, { roughness: 0.9 }), shoulder, (f - 1) * 0.028, -0.53, 0.045);
+        }
+      } else if (glove) {
+        add(new THREE.SphereGeometry(0.058, 10, 8), glove, shoulder, 0, -0.47, 0.01);
+      } else {
+        add(new THREE.SphereGeometry(0.052, 9, 7), mat(kit.headColor, { roughness: 0.75 }), shoulder, 0, -0.47, 0.01);
+      }
+      shoulder.rotation.z = side * -0.07;
+      kit.shoulders.push({ shoulder, side });
+    }
+
+    // Ноги и обувь: своя у школьницы, лапы у фури, сапоги у остальных.
+    for (const side of [-1, 1]) {
+      const leg = new THREE.Group();
+      leg.position.set(side * 0.1 * kit.build, 0.66, 0);
+      model.add(leg);
+      add(new THREE.CapsuleGeometry(paw ? 0.085 : 0.068, 0.48, 3, 8), mat(kit.legsColor, { roughness: 0.94 }), leg, 0, -0.27, 0);
+      if (skin === 'schoolgirl') {
+        add(new THREE.CylinderGeometry(0.058, 0.054, 0.24, 10), mat(0xeef0f4, { roughness: 0.9 }), leg, 0, -0.4, 0);
+        add(new THREE.BoxGeometry(0.11, 0.06, 0.21), mat(0x1d1a16, { roughness: 0.45, metalness: 0.25 }), leg, 0, -0.57, 0.05);
+      } else if (paw) {
+        add(new THREE.BoxGeometry(0.14, 0.08, 0.26), mat(kit.headColor, { roughness: 0.99 }), leg, 0, -0.57, 0.05);
+      } else {
+        add(new THREE.BoxGeometry(0.12, 0.09, 0.24), mat(0x241f1a, { roughness: 0.65, metalness: 0.1 }), leg, 0, -0.57, 0.035);
+      }
+      kit.legs.push(leg);
+    }
+
+    if (skin === 'tv') this._headTv(kit);
+    else if (skin === 'furry') this._headFurry(kit);
+    else if (skin === 'schoolgirl') this._headSchoolgirl(kit);
+    else this._headHuman(kit, skin);
+
+    const visorMaterial = new THREE.MeshStandardMaterial({
+      color: 0x0a1410,
+      emissive: accent,
+      emissiveIntensity: 1.4,
+      roughness: 0.4,
+    });
+    const visor = add(new THREE.BoxGeometry(0.08, 0.026, 0.02), visorMaterial, body, 0, 0.25, 0.13);
+
+    model.traverse((object) => {
+      if (object.isMesh) object.castShadow = false;
+    });
+
+    return {
+      body,
+      bodyMaterial: torsoMat,
+      visor,
+      visorMaterial,
+      model,
+      kit,
+      front: kit.front,
+      frontMarker: kit.frontMarker,
+    };
+  }
+
+  // --- Проводник: форменный китель, погоны, фуражка ---------------------
+
+  _skinConductor(kit) {
+    const { add, body, mat, accent, build } = kit;
+    const brass = mat(0x8a7a48, { metalness: 0.85, roughness: 0.32 });
+    const dark = mat(0x171c14, { roughness: 0.88 });
+    const shirt = mat(0xd9d4c4, { roughness: 0.85 });
+    // Борт кителя, воротник, рубашка.
+    add(new THREE.BoxGeometry(0.075, 0.46, 0.02), dark, body, 0, 0.14, 0.118);
+    add(new THREE.BoxGeometry(0.3 * build, 0.11, 0.05), shirt, body, 0, 0.38, 0.09);
+    add(new THREE.BoxGeometry(0.34 * build, 0.07, 0.2), dark, body, 0, 0.44, 0);
+    // Погоны.
+    for (const side of [-1, 1]) {
+      add(new THREE.BoxGeometry(0.12, 0.02, 0.08), brass, body, side * 0.14 * build, 0.44, 0);
+    }
+    // Ремень, бляха, компостер, нашивка.
+    add(new THREE.BoxGeometry(0.38 * build, 0.05, 0.25), dark, body, 0, -0.04, 0);
+    add(new THREE.BoxGeometry(0.06, 0.04, 0.02), brass, body, 0, -0.04, 0.13);
+    const punch = add(new THREE.BoxGeometry(0.05, 0.08, 0.03), mat(0x30302a, { metalness: 0.7, roughness: 0.4 }), body, 0.13, -0.1, 0.12);
+    punch.rotation.z = -0.2;
+    add(new THREE.BoxGeometry(0.018, 0.075, 0.055), mat(accent, { emissive: accent, emissiveIntensity: 0.6 }), body, -0.21 * build, 0.06, 0.04);
+    for (let i = 0; i < 3; i += 1) add(new THREE.SphereGeometry(0.013, 7, 5), brass, body, 0.035, 0.28 - i * 0.11, 0.125);
+    kit.front = punch;
+  }
+
+  // --- Японская школьница: матроска, юбка, гольфы, два хвоста -----------
+
+  _skinSchoolgirl(kit) {
+    const { add, body, mat } = kit;
+    const navy = mat(0x27304d, { roughness: 0.88 });
+    const white = mat(0xeef0f4, { roughness: 0.85 });
+    const red = mat(0xa8202f, { roughness: 0.8 });
+
+    // Матроска: воротник-«парус», полосы, галстук.
+    add(new THREE.BoxGeometry(0.38, 0.1, 0.24), white, body, 0, 0.42, 0);
+    for (const side of [-1, 1]) {
+      const flap = add(new THREE.BoxGeometry(0.13, 0.12, 0.015), white, body, side * 0.12, 0.33, 0.125);
+      flap.rotation.z = side * 0.3;
+      add(new THREE.BoxGeometry(0.1, 0.01, 0.01), navy, body, side * 0.12, 0.35, 0.135).rotation.z = side * 0.3;
+      add(new THREE.BoxGeometry(0.09, 0.008, 0.01), navy, body, side * 0.12, 0.32, 0.135).rotation.z = side * 0.3;
+    }
+    add(new THREE.BoxGeometry(0.07, 0.14, 0.025), red, body, 0, 0.27, 0.13);
+    const knot = add(new THREE.BoxGeometry(0.11, 0.06, 0.03), red, body, 0, 0.21, 0.135);
+    knot.rotation.z = 0.08;
+
+    // Плиссированная юбка: клинья от пояса вниз и наружу.
+    const skirt = new THREE.Group();
+    skirt.position.y = -0.16;
+    body.add(skirt);
+    for (let i = 0; i < 14; i += 1) {
+      const angle = (i / 14) * Math.PI * 2;
+      const panel = add(new THREE.BoxGeometry(0.085, 0.34, 0.025), navy, skirt,
+        Math.sin(angle) * 0.16, -0.12, Math.cos(angle) * 0.13, 0.2, angle, 0.09);
+      panel.scale.set(1, 1, 1);
+    }
+    add(new THREE.CylinderGeometry(0.17, 0.24, 0.34, 14, 1, true), mat(0x232c48, { roughness: 0.9, side: THREE.DoubleSide }), skirt, 0, -0.1, 0);
+
+    // Сумка через плечо и бант на груди.
+    const strap = add(new THREE.BoxGeometry(0.035, 0.46, 0.015), mat(0x4a3a2a, { roughness: 0.9 }), body, -0.1, 0.18, 0.125);
+    strap.rotation.z = 0.38;
+    add(new THREE.BoxGeometry(0.17, 0.14, 0.07), mat(0x3a2e22, { roughness: 0.88 }), body, 0.17, -0.18, 0.02);
+    add(new THREE.BoxGeometry(0.05, 0.025, 0.015), mat(kit.accent, { emissive: kit.accent, emissiveIntensity: 1 }), body, 0.17, -0.15, 0.06);
+    kit.front = knot;
+  }
+
+  /** Волосы: шапка сверху и «затылок», чтобы лицо всегда оставалось открытым. */
+  _hair(kit, color, { radius = 0.142, drop = 0.4, back = 0.62 } = {}) {
+    const { add, headGroup: head, mat } = kit;
+    const hairMat = mat(color, { roughness: 0.9, emissive: new THREE.Color(color).multiplyScalar(0.22).getHex(), emissiveIntensity: 0.7 });
+    const cap = add(new THREE.SphereGeometry(radius, 18, 12, 0, Math.PI * 2, 0, Math.PI * drop), hairMat, head, 0, 0.16, 0);
+    cap.scale.set(0.97, 1.02, 1.03);
+    const backPanel = add(new THREE.SphereGeometry(radius, 18, 12, Math.PI, Math.PI, Math.PI * drop, Math.PI * (back - drop)), hairMat, head, 0, 0.16, 0);
+    backPanel.scale.set(0.97, 1.02, 1.03);
+    return hairMat;
+  }
+
+  _headSchoolgirl(kit) {
+    const { add, headGroup: head, mat, accent } = kit;
+    this._headSphere(kit, 'schoolgirl', 0.134);
+    const hairMat = this._hair(kit, 0x3a2b28, { radius: 0.146, drop: 0.34, back: 0.82 });
+    // Чёлка и два хвоста с лентами.
+    add(new THREE.BoxGeometry(0.23, 0.05, 0.035), hairMat, head, 0, 0.256, 0.106);
+    add(new THREE.BoxGeometry(0.06, 0.16, 0.03), hairMat, head, -0.122, 0.15, 0.082).rotation.z = 0.14;
+    add(new THREE.BoxGeometry(0.06, 0.16, 0.03), hairMat, head, 0.122, 0.15, 0.082).rotation.z = -0.14;
+    for (const side of [-1, 1]) {
+      const tail = add(new THREE.CapsuleGeometry(0.042, 0.28, 3, 8), hairMat, head, side * 0.16, 0.12, -0.04);
+      tail.rotation.z = side * 0.5;
+      tail.rotation.x = 0.22;
+      add(new THREE.BoxGeometry(0.08, 0.045, 0.028), mat(0xa8202f, { roughness: 0.7 }), head, side * 0.14, 0.24, -0.01);
+    }
+  }
+
+  // --- Фури: лиса в форме -------------------------------------------------
+
+  _skinFurry(kit) {
+    const { add, body, model, mat, accent } = kit;
+    const fur = mat(0x9a6a3c, { roughness: 0.99 });
+    const furLight = mat(0xd9c3a1, { roughness: 0.99 });
+    // Меховой воротник, грудь, хвост.
+    add(new THREE.TorusGeometry(0.16, 0.05, 8, 16), furLight, body, 0, 0.44, 0, Math.PI / 2);
+    add(new THREE.SphereGeometry(0.14, 12, 10), furLight, body, 0, 0.3, 0.1).scale.set(1, 0.9, 0.5);
+    const tail = add(new THREE.CapsuleGeometry(0.085, 0.48, 4, 10), fur, model, 0, 0.68, -0.26);
+    tail.rotation.x = -1.0;
+    tail.rotation.z = 0.18;
+    add(new THREE.SphereGeometry(0.11, 10, 8), furLight, model, 0, 0.5, -0.58);
+    add(new THREE.BoxGeometry(0.06, 0.04, 0.012), mat(accent, { emissive: accent, emissiveIntensity: 0.9 }), body, 0.11, 0.22, 0.125);
+  }
+
+  _headFurry(kit) {
+    const { add, headGroup: head, mat, accent } = kit;
+    const fur = mat(0x9a6a3c, { roughness: 0.99 });
+    const light = mat(0xd9c3a1, { roughness: 0.99 });
+    const dark = mat(0x241814, { roughness: 0.7 });
+    this._headSphere(kit, 'furry', 0.138);
+    head.children[0].position.y = 0.18;
+    add(new THREE.CapsuleGeometry(0.045, 0.03, 3, 8), light, head, 0, 0.132, 0.132).rotation.x = Math.PI / 2;
+    add(new THREE.SphereGeometry(0.019, 10, 8), dark, head, 0, 0.138, 0.172);
+    for (const side of [-1, 1]) {
+      const ear = add(new THREE.ConeGeometry(0.068, 0.19, 6), fur, head, side * 0.085, 0.34, -0.01);
+      ear.rotation.z = side * -0.16;
+      add(new THREE.ConeGeometry(0.036, 0.12, 6), light, head, side * 0.085, 0.34, 0.012).rotation.z = side * -0.16;
+      add(new THREE.BoxGeometry(0.055, 0.006, 0.004), light, head, side * 0.045, 0.128, 0.178).rotation.z = side * 0.2;
+    }
+    add(new THREE.CylinderGeometry(0.145, 0.145, 0.065, 14), mat(0x22281f, { roughness: 0.9 }), head, 0, 0.29, 0);
+    add(new THREE.BoxGeometry(0.25, 0.015, 0.12), mat(0x14170f, { roughness: 0.9 }), head, 0, 0.26, 0.13);
+  }
+
+  // --- Телевизор на голове -----------------------------------------------
+
+  _skinTv(kit) {
+    const { add, body, mat, accent } = kit;
+    add(new THREE.BoxGeometry(0.38, 0.18, 0.26), mat(0x232838, { roughness: 0.7, metalness: 0.3 }), body, 0, 0.3, 0);
+    const cable = add(new THREE.TorusGeometry(0.09, 0.015, 6, 12, Math.PI * 1.3), mat(0x14161a, { roughness: 0.6 }), body, 0.17, 0.02, -0.1);
+    cable.rotation.y = Math.PI / 2;
+    add(new THREE.BoxGeometry(0.05, 0.4, 0.015), mat(0x1a1d26, { roughness: 0.9 }), body, -0.12, 0.12, 0.125).rotation.z = 0.3;
+    add(new THREE.BoxGeometry(0.04, 0.04, 0.015), mat(accent, { emissive: accent, emissiveIntensity: 1.2 }), body, 0.12, 0.22, 0.125);
+  }
+
+  _headTv(kit) {
+    const { add, headGroup: head, mat, accent } = kit;
+    const shell = mat(0x333a4a, { roughness: 0.5, metalness: 0.35 });
+    const trim = mat(0x14171f, { roughness: 0.6, metalness: 0.2 });
+    add(new THREE.BoxGeometry(0.34, 0.3, 0.31), shell, head, 0, 0.19, 0);
+    add(new THREE.BoxGeometry(0.37, 0.035, 0.33), trim, head, 0, 0.35, 0);
+    const screenMat = new THREE.MeshBasicMaterial({ map: this._tvNoise(accent), toneMapped: false });
+    const screen = add(new THREE.PlaneGeometry(0.22, 0.18), screenMat, head, -0.03, 0.19, 0.157);
+    screen.userData.tvScreen = true;
+    add(new THREE.BoxGeometry(0.018, 0.18, 0.015), trim, head, 0.135, 0.19, 0.158);
+    for (let i = 0; i < 3; i += 1) add(new THREE.CylinderGeometry(0.015, 0.015, 0.018, 8), mat(0x8a8a86, { metalness: 0.7, roughness: 0.4 }), head, 0.135, 0.25 - i * 0.055, 0.158).rotation.x = Math.PI / 2;
+    add(new THREE.CylinderGeometry(0.005, 0.005, 0.28, 5), mat(0x2a2a2a, { metalness: 0.7, roughness: 0.4 }), head, -0.08, 0.48, 0).rotation.z = 0.32;
+    add(new THREE.CylinderGeometry(0.005, 0.005, 0.24, 5), mat(0x2a2a2a, { metalness: 0.7, roughness: 0.4 }), head, 0.07, 0.48, 0).rotation.z = -0.2;
+    add(new THREE.SphereGeometry(0.011, 6, 5), mat(accent, { emissive: accent, emissiveIntensity: 1.4 }), head, -0.14, 0.48, 0);
+    kit.tvScreen = screen;
+    kit.front = screen;
+  }
+
+  _tvNoise(accent) {
+    if (!this._tvNoiseCache) this._tvNoiseCache = new Map();
+    const key = Number(accent) || 0;
+    if (this._tvNoiseCache.has(key)) return this._tvNoiseCache.get(key);
+    const size = 64;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const image = ctx.createImageData(size, size);
+    const tint = new THREE.Color(key);
+    for (let y = 0; y < size; y += 1) {
+      for (let x = 0; x < size; x += 1) {
+        const i = (y * size + x) * 4;
+        const scan = y % 3 === 0 ? 0.55 : 1;
+        const value = (0.35 + Math.random() * 0.65) * scan;
+        image.data[i] = Math.round(255 * value * (0.25 + tint.r * 0.75));
+        image.data[i + 1] = Math.round(255 * value * (0.25 + tint.g * 0.75));
+        image.data[i + 2] = Math.round(255 * value * (0.35 + tint.b * 0.65));
+        image.data[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    this._tvNoiseCache.set(key, texture);
+    return texture;
+  }
+
+  // --- Машинист: комбинезон, лямки, каска --------------------------------
+
+  _skinEngineer(kit) {
+    const { add, body, mat, accent, build } = kit;
+    const denim = mat(0x374a5c, { roughness: 0.95 });
+    const strap = mat(0x1f2730, { roughness: 0.9 });
+    add(new THREE.BoxGeometry(0.3 * build, 0.3, 0.03), denim, body, 0, 0.1, 0.115);
+    for (const side of [-1, 1]) {
+      add(new THREE.BoxGeometry(0.05, 0.34, 0.015), strap, body, side * 0.1 * build, 0.26, 0.125);
+      add(new THREE.BoxGeometry(0.085, 0.06, 0.018), mat(0x7a2a20, { roughness: 0.9 }), body, side * 0.1 * build, 0.38, 0.125);
+    }
+    add(new THREE.BoxGeometry(0.12, 0.1, 0.025), mat(0x2a3642, { roughness: 0.9 }), body, -0.09, -0.02, 0.115);
+    add(new THREE.CylinderGeometry(0.01, 0.01, 0.12, 6), mat(0xb0b0a8, { metalness: 0.8, roughness: 0.35 }), body, -0.09, 0.08, 0.13);
+    add(new THREE.SphereGeometry(0.04, 8, 6), mat(0xffe1a0, { emissive: 0xffc169, emissiveIntensity: 2.2 }), body, 0.13, 0.12, 0.12);
+    add(new THREE.BoxGeometry(0.03, 0.05, 0.012), mat(accent, { emissive: accent, emissiveIntensity: 0.7 }), body, 0.16, 0.2, 0.122);
+  }
+
+  // --- Ревизор: кожаное пальто, шляпа, лампа -----------------------------
+
+  _skinInspector(kit) {
+    const { add, body, mat, accent, build } = kit;
+    const leather = mat(0x2a2118, { roughness: 0.72, metalness: 0.12 });
+    const leatherDark = mat(0x17110d, { roughness: 0.8 });
+    const brass = mat(0x8a7a48, { metalness: 0.85, roughness: 0.32 });
+    // Полы пальто до колен, лацканы, пояс.
+    add(new THREE.BoxGeometry(0.4 * build, 0.5, 0.2), leather, body, 0, -0.16, -0.01);
+    for (const side of [-1, 1]) {
+      const lapel = add(new THREE.BoxGeometry(0.1, 0.22, 0.015), leatherDark, body, side * 0.1, 0.3, 0.125);
+      lapel.rotation.z = side * 0.22;
+    }
+    add(new THREE.BoxGeometry(0.4 * build, 0.05, 0.22), leatherDark, body, 0, -0.05, 0);
+    add(new THREE.BoxGeometry(0.06, 0.04, 0.02), brass, body, 0, -0.05, 0.12);
+    // Часы на цепочке — акцент.
+    add(new THREE.TorusGeometry(0.026, 0.005, 6, 10), brass, body, 0.11, 0.02, 0.125);
+    add(new THREE.CylinderGeometry(0.025, 0.025, 0.007, 12), mat(accent, { emissive: accent, emissiveIntensity: 0.5, metalness: 0.4, roughness: 0.3 }), body, 0.11, 0.02, 0.132).rotation.x = Math.PI / 2;
+    // Керосиновая лампа в левой руке.
+    const lamp = new THREE.Group();
+    lamp.position.set(-0.27 * build, 0.1, 0.1);
+    body.add(lamp);
+    add(new THREE.CylinderGeometry(0.035, 0.045, 0.085, 10), brass, lamp, 0, -0.02, 0);
+    add(new THREE.CylinderGeometry(0.028, 0.028, 0.055, 10), mat(0xffe1a0, { emissive: 0xffc169, emissiveIntensity: 2.4 }), lamp, 0, 0.05, 0);
+    add(new THREE.CylinderGeometry(0.018, 0.044, 0.045, 10), brass, lamp, 0, 0.1, 0);
+    kit.front = lamp;
+  }
+
+  /**
+   * Лицо рисуется на текстуре головы: глаза, брови, рот читаются с двух
+   * метров, чего не добиться от мелких шариков в тёмном вагоне.
+   * Сфера Three.js кладёт +Z на u = 0.25, поэтому лицо рисуем у x = 128/512.
+   */
+  _faceTexture(kind, headColor, accent) {
+    if (!this._faceCache) this._faceCache = new Map();
+    const key = `${kind}|${headColor}|${accent}`;
+    if (this._faceCache.has(key)) return this._faceCache.get(key);
+
+    const width = 512;
+    const height = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    const hex = (value) => `#${value.toString(16).padStart(6, '0')}`;
+    const shade = (value, factor) => {
+      const c = new THREE.Color(value).multiplyScalar(factor);
+      return `#${c.getHexString()}`;
+    };
+
+    ctx.fillStyle = hex(headColor);
+    ctx.fillRect(0, 0, width, height);
+    // Мягкая тень к вискам и подбородку.
+    const gradient = ctx.createLinearGradient(0, 0, 0, height);
+    gradient.addColorStop(0, 'rgba(0,0,0,0.22)');
+    gradient.addColorStop(0.42, 'rgba(0,0,0,0)');
+    gradient.addColorStop(0.78, 'rgba(0,0,0,0.05)');
+    gradient.addColorStop(1, 'rgba(0,0,0,0.3)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = shade(headColor, 0.82);
+    ctx.fillRect(0, 0, 54, height);
+    ctx.fillRect(width - 54, 0, 54, height);
+
+    const cx = 128;
+    const eyeY = 104;
+    const eyeDx = 27;
+    const ink = '#1b1512';
+    const glow = hex(accent);
+
+    // Черты растянуты по горизонтали и слегка по вертикали: 512 px текстуры
+    // натянуты на полный оборот сферы, иначе лицо выглядит крошечным.
+    // По вертикали глаза ставим чуть выше «экватора» — там, где их видно
+    // из-под фуражки, каски или шляпы.
+    ctx.save();
+    ctx.translate(cx, 114);
+    ctx.scale(1.55, 1.1);
+    ctx.translate(-cx, -104);
+
+    const drawEye = (x, radius, pupilRadius, iris) => {
+      ctx.fillStyle = 'rgba(255,252,244,0.95)';
+      ctx.beginPath();
+      ctx.ellipse(x, eyeY, radius, radius * 0.85, 0, 0, Math.PI * 2);
+      ctx.fill();
+      if (iris) {
+        ctx.fillStyle = iris;
+        ctx.beginPath();
+        ctx.arc(x, eyeY + 1, pupilRadius * 1.75, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = ink;
+      ctx.beginPath();
+      ctx.arc(x, eyeY + 1, pupilRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.92)';
+      ctx.beginPath();
+      ctx.arc(x - pupilRadius * 0.45, eyeY - pupilRadius * 0.45, Math.max(1.4, pupilRadius * 0.36), 0, Math.PI * 2);
+      ctx.fill();
+    };
+
+    if (kind === 'schoolgirl') {
+      // Большие аниме-глаза с ресницами и румянец.
+      ctx.fillStyle = 'rgba(214,120,120,0.35)';
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.ellipse(cx + side * 46, 128, 20, 9, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      for (const side of [-1, 1]) drawEye(cx + side * eyeDx, 16, 5, glow);
+      ctx.strokeStyle = ink;
+      ctx.lineWidth = 4;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.arc(cx + side * eyeDx, eyeY - 2, 17, Math.PI * 1.12, Math.PI * 1.88);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx + side * (eyeDx + 14), eyeY - 10);
+        ctx.lineTo(cx + side * (eyeDx + 22), eyeY - 14);
+        ctx.stroke();
+      }
+      ctx.fillStyle = '#a8202f';
+      ctx.beginPath();
+      ctx.ellipse(cx, 139, 7, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (kind === 'inspector') {
+      // Запавшие глаза и тонкие губы: лицо человека, который слишком много видел.
+      for (const side of [-1, 1]) {
+        ctx.fillStyle = 'rgba(30,24,20,0.55)';
+        ctx.beginPath();
+        ctx.ellipse(cx + side * eyeDx, eyeY + 2, 19, 14, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Пенсне-ободки под глазами.
+      ctx.strokeStyle = 'rgba(236,226,204,0.9)';
+      ctx.lineWidth = 2.4;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.arc(cx + side * eyeDx, eyeY, 18, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.moveTo(cx - eyeDx + 18, eyeY - 1);
+      ctx.quadraticCurveTo(cx, eyeY - 8, cx + eyeDx - 18, eyeY - 1);
+      ctx.stroke();
+      for (const side of [-1, 1]) drawEye(cx + side * eyeDx, 9, 3.6, glow);
+      ctx.strokeStyle = 'rgba(40,32,26,0.85)';
+      ctx.lineWidth = 3;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(cx + side * (eyeDx - 16), eyeY - 16);
+        ctx.quadraticCurveTo(cx + side * eyeDx, eyeY - 23, cx + side * (eyeDx + 16), eyeY - 14);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = '#3a2a24';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(cx - 11, 143);
+      ctx.quadraticCurveTo(cx, 146, cx + 11, 143);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(60,48,40,0.5)';
+      ctx.lineWidth = 2;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(cx + side * 34, 96);
+        ctx.lineTo(cx + side * 44, 90);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx + side * 30, 132);
+        ctx.lineTo(cx + side * 42, 136);
+        ctx.stroke();
+      }
+    } else if (kind === 'furry') {
+      // Морда: акцентные глаза и тёмный нос.
+      for (const side of [-1, 1]) {
+        ctx.fillStyle = 'rgba(232,212,180,0.55)';
+        ctx.beginPath();
+        ctx.ellipse(cx + side * eyeDx, eyeY + 4, 20, 15, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      for (const side of [-1, 1]) drawEye(cx + side * eyeDx, 12, 4.2, glow);
+      ctx.fillStyle = '#241814';
+      ctx.beginPath();
+      ctx.ellipse(cx, 136, 9, 6.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#241814';
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.moveTo(cx, 142);
+      ctx.lineTo(cx - 10, 150);
+      ctx.moveTo(cx, 142);
+      ctx.lineTo(cx + 10, 150);
+      ctx.stroke();
+      // Усы-щётки.
+      ctx.strokeStyle = 'rgba(232,212,180,0.75)';
+      ctx.lineWidth = 1.6;
+      for (const side of [-1, 1]) {
+        for (let i = 0; i < 3; i += 1) {
+          ctx.beginPath();
+          ctx.moveTo(cx + side * 12, 134 + i * 5);
+          ctx.lineTo(cx + side * 34, 130 + i * 7);
+          ctx.stroke();
+        }
+      }
+    } else {
+      // Люди: проводник и машинист.
+      for (const side of [-1, 1]) drawEye(cx + side * eyeDx, 13, 4.4, null);
+      ctx.strokeStyle = 'rgba(38,30,24,0.9)';
+      ctx.lineWidth = 4;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.moveTo(cx + side * (eyeDx - 15), eyeY - 17);
+        ctx.lineTo(cx + side * (eyeDx + 15), eyeY - 20);
+        ctx.stroke();
+      }
+      if (kind === 'conductor') {
+        ctx.strokeStyle = '#4a3a2c';
+        ctx.lineWidth = 6;
+        ctx.beginPath();
+        ctx.moveTo(cx - 17, 133);
+        ctx.quadraticCurveTo(cx, 128, cx + 17, 133);
+        ctx.stroke();
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(cx - 10, 146);
+        ctx.quadraticCurveTo(cx, 149, cx + 10, 146);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = 'rgba(58,42,32,0.9)';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(cx - 12, 146);
+        ctx.quadraticCurveTo(cx, 143, cx + 12, 146);
+        ctx.stroke();
+        // Щетина и пятно мазута.
+        ctx.fillStyle = 'rgba(42,34,26,0.22)';
+        ctx.beginPath();
+        ctx.ellipse(cx, 160, 30, 20, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(20,18,16,0.5)';
+        ctx.beginPath();
+        ctx.ellipse(cx + 38, 120, 9, 5, 0.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    ctx.restore();
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = 4;
+    this._faceCache.set(key, texture);
+    return texture;
+  }
+
+  /** Голова-сфера с нарисованным лицом (общая для людей, школьницы и фури). */
+  _headSphere(kit, kind, radius = 0.132) {
+    const { add, headGroup: head } = kit;
+    // Лицо слегка светится собственной текстурой: в вагоне лампа сверху,
+    // и без подсветки белки глаз и рот пропадают в тени под козырьком.
+    const texture = this._faceTexture(kind, kit.headColor, kit.accent);
+    const material = new THREE.MeshStandardMaterial({
+      map: texture,
+      color: 0xd8d2c8,
+      roughness: 0.86,
+      metalness: 0.02,
+      emissive: 0xffffff,
+      emissiveMap: texture,
+      emissiveIntensity: 0.34,
+    });
+    const sphere = add(new THREE.SphereGeometry(radius, 24, 18), material, head, 0, 0.16, 0);
+    sphere.scale.set(0.95, 1.03, 1);
+    return sphere;
+  }
+
+  _headHuman(kit, skin) {
+    const { add, headGroup: head, mat, accent, look } = kit;
+    const hairMat = mat(skin === 'inspector' ? 0x2f2a24 : 0x2b2e29, { roughness: 0.9 });
+    this._headSphere(kit, skin === 'inspector' ? 'inspector' : (skin === 'engineer' ? 'engineer' : 'conductor'));
+    if (skin === 'conductor') {
+      add(new THREE.CylinderGeometry(0.152, 0.148, 0.09, 16), mat(0x1d241c, { roughness: 0.9 }), head, 0, 0.3, 0);
+      add(new THREE.CylinderGeometry(0.15, 0.15, 0.034, 16), mat(0x14180f, { roughness: 0.9 }), head, 0, 0.252, 0);
+      add(new THREE.BoxGeometry(0.29, 0.016, 0.15), mat(0x0f120c, { roughness: 0.8 }), head, 0, 0.242, 0.135);
+      add(new THREE.CylinderGeometry(0.022, 0.022, 0.008, 10), mat(0x8a7a48, { metalness: 0.8, roughness: 0.3 }), head, 0, 0.312, 0.15).rotation.x = Math.PI / 2;
+    } else if (skin === 'inspector') {
+      add(new THREE.CylinderGeometry(0.195, 0.195, 0.014, 18), mat(0x1d1913, { roughness: 0.9 }), head, 0, 0.285, 0);
+      add(new THREE.CylinderGeometry(0.1, 0.124, 0.115, 14), mat(0x241d15, { roughness: 0.9 }), head, 0, 0.345, 0);
+      add(new THREE.TorusGeometry(0.106, 0.012, 6, 14), mat(0x14100c, { roughness: 0.9 }), head, 0, 0.298, 0, Math.PI / 2);
+    } else if (skin === 'engineer') {
+      // Каска машиниста с фонарём.
+      add(new THREE.SphereGeometry(0.148, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.52), mat(0xc9a227, { roughness: 0.45, metalness: 0.2, emissive: 0x4a3a08, emissiveIntensity: 0.8 }), head, 0, 0.2, 0);
+      add(new THREE.TorusGeometry(0.148, 0.016, 8, 20), mat(0xa8861c, { roughness: 0.5 }), head, 0, 0.215, 0, Math.PI / 2);
+      add(new THREE.BoxGeometry(0.075, 0.05, 0.045), mat(0x2b2b26, { roughness: 0.5 }), head, 0, 0.315, 0.11);
+      add(new THREE.CylinderGeometry(0.026, 0.026, 0.016, 10), mat(0xffe6a0, { emissive: 0xffc169, emissiveIntensity: 3 }), head, 0, 0.315, 0.14).rotation.x = Math.PI / 2;
+    } else if (look.hat === 'beanie') {
+      add(new THREE.SphereGeometry(0.14, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.55), mat(look.scarf, { roughness: 0.95 }), head, 0, 0.21, 0);
+      add(new THREE.TorusGeometry(0.132, 0.02, 8, 18), mat(look.scarf, { roughness: 0.95 }), head, 0, 0.21, 0, Math.PI / 2);
+    } else if (look.hat === 'cap') {
+      add(new THREE.CylinderGeometry(0.137, 0.137, 0.075, 14), mat(0x232a22, { roughness: 0.9 }), head, 0, 0.27, 0);
+      add(new THREE.BoxGeometry(0.26, 0.016, 0.14), mat(0x1b1c19, { roughness: 0.85 }), head, 0, 0.24, 0.12);
+    } else {
+      this._hair(kit, skin === 'inspector' ? 0x2f2a24 : 0x2b2e29, { drop: 0.42, back: 0.66 });
+    }
+  }
+
+  /** Смена скина на лету: пересобираем тело, не трогая табличку и кольцо. */
+  _restyleAvatar(avatar, skin, accent) {
+    if (avatar.skin === skin && avatar.accent === accent) return;
+    avatar.skin = skin;
+    avatar.accent = accent;
+    avatar.group.remove(avatar.model);
+    avatar.model.traverse((object) => {
+      if (!object.isMesh) return;
+      object.geometry.dispose();
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) if (material) material.dispose();
+    });
+    const model = new THREE.Group();
+    model.rotation.y = Math.PI;
+    avatar.group.add(model);
+    const parts = this._buildCrewModel(model, skin, accent, avatar.look);
+    avatar.kit = parts.kit;
+    if (avatar.downed) {
+      model.rotation.set(-Math.PI / 2 * 0.94, Math.PI, 0);
+      model.position.set(0, 0.19, 0.62);
+    }
+    avatar.model = model;
+    avatar.body = parts.body;
+    avatar.bodyMaterial = parts.bodyMaterial;
+    avatar.visor = parts.visor;
+    avatar.visorMaterial = parts.visorMaterial;
+    avatar.ringMaterial.color.setHex(RemotePlayers.ACCENTS[accent] || RemotePlayers.ACCENTS[0]);
   }
 
   _removeAvatar(avatar) {
@@ -6113,6 +7155,20 @@ class RemotePlayers {
     if (!state) return;
     avatar.hasState = true;
     avatar.inCar = state.c === 1 || state.c === true;
+    avatar.downed = state.d === 1 || state.d === true;
+    if (state.skin && (state.skin !== avatar.skin || state.accent !== avatar.accent)) {
+      this._restyleAvatar(avatar, state.skin, Number.isInteger(state.accent) ? state.accent : 0);
+    }
+    if (avatar.downed !== avatar._downedApplied) {
+      avatar._downedApplied = avatar.downed;
+      if (avatar.downed) {
+        avatar.model.rotation.set(-Math.PI / 2 * 0.94, Math.PI, 0);
+        avatar.model.position.set(0, 0.19, 0.62);
+      } else {
+        avatar.model.rotation.set(0, Math.PI, 0);
+        avatar.model.position.set(0, 0, 0);
+      }
+    }
     if (!avatar.inCar) {
       avatar.group.visible = false;
       if (this.voice) this.voice.setRemoteInCar(avatar.id, false);
@@ -6195,7 +7251,9 @@ class RemotePlayers {
       if (stale !== avatar.stale) {
         avatar.stale = stale;
         avatar.bodyMaterial.emissive.setHex(stale ? 0x2a0d0a : 0x18251c);
-        avatar.ringMaterial.color.setHex(stale ? 0xff5a4e : 0x9be3dc);
+        avatar.ringMaterial.color.setHex(stale
+          ? 0xff5a4e
+          : (RemotePlayers.ACCENTS[avatar.accent] || RemotePlayers.ACCENTS[0]));
       }
 
       // Наблюдение за голосом.
@@ -6217,8 +7275,23 @@ class RemotePlayers {
       }
 
       // Лёгкое «дыхание»: плечи поднимаются, когда пассажир говорит.
-      const baseY = 0.82 * (avatar.look ? avatar.look.height : 1);
-      avatar.body.position.y = baseY + (speaking ? Math.sin(elapsed * 6) * 0.008 : 0);
+      if (!avatar.downed) {
+        avatar.body.position.y = 0.82 + (speaking ? Math.sin(elapsed * 6) * 0.012 : 0);
+        avatar.body.position.x = Math.sin(elapsed * 1.7 + avatar.group.position.z) * 0.006;
+      }
+
+      // Телевизор: экран «шумит», а голос качает яркость.
+      if (avatar.kit && avatar.kit.tvScreen) {
+        const map = avatar.kit.tvScreen.material.map;
+        if (map) {
+          map.offset.x = (elapsed * 0.37) % 1;
+          map.offset.y = (elapsed * 0.21) % 1;
+        }
+        avatar.kit.tvScreen.material.color.setScalar(speaking ? 1 : 0.82);
+      }
+
+      // Лёжа табличку держим выше, чтобы она не тонула в полу.
+      avatar.tag.position.y = (avatar.downed ? 1.15 : 2.18) * (avatar.look ? avatar.look.height : 1);
     }
   }
 
@@ -6229,6 +7302,86 @@ class RemotePlayers {
 
   setNetwork(network) {
     this.network = network;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Витрина гардероба
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Показывает выбранный образ в меню (камера смотрит в вагон с севера).
+   * Модель собирается тем же кодом, что и удалённые игроки, поэтому
+   * в гардеробе видно ровно то, что увидят напарники.
+   */
+  showSkinPreview(skin, accent = 0) {
+    // На узких экранах гардероб занимает всё окно, и витрина была бы скрыта
+    // панелью: там образ показывают карточки.
+    if (window.innerWidth < 900) return;
+    const nextSkin = RemotePlayers.SKINS.includes(skin) ? skin : 'conductor';
+    const nextAccent = Number.isInteger(accent) ? clamp(accent, 0, 3) : 0;
+    if (this._preview) {
+      if (this._preview.skin === nextSkin && this._preview.accent === nextAccent) return;
+      this.hideSkinPreview();
+    }
+
+    const group = new THREE.Group();
+    group.position.set(-1.05, 0, 10.9);
+    group.name = 'Витрина гардероба';
+    const model = new THREE.Group();
+    // Лицом к камере меню: модель собрана в +Z, камера смотрит с +Z.
+    model.rotation.y = 0;
+    group.add(model);
+
+    const look = RemotePlayers._crewLook(`preview|${nextSkin}|${nextAccent}`, 'preview');
+    const parts = this._buildCrewModel(model, nextSkin, nextAccent, look);
+    group.scale.setScalar(look.height);
+
+    // Мягкий свет витрины: в салоне темно, без него видны только силуэты.
+    const key = new THREE.PointLight(0xdfe9d6, 7, 4.6, 2);
+    key.position.set(0.55, 2.25, 2.2);
+    group.add(key);
+    const rim = new THREE.PointLight(RemotePlayers.ACCENTS[nextAccent] || 0x9be3dc, 4.2, 3.4, 2);
+    rim.position.set(-0.7, 1.5, -1.4);
+    group.add(rim);
+
+    this.scene.add(group);
+    this._preview = {
+      group,
+      model,
+      body: parts.body,
+      kit: parts.kit,
+      skin: nextSkin,
+      accent: nextAccent,
+      baseY: 0,
+    };
+  }
+
+  hideSkinPreview() {
+    if (!this._preview) return;
+    const { group } = this._preview;
+    group.traverse((object) => {
+      if (!object.isMesh) return;
+      object.geometry.dispose();
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) if (material) material.dispose();
+    });
+    this.scene.remove(group);
+    this._preview = null;
+  }
+
+  get previewActive() {
+    return Boolean(this._preview);
+  }
+
+  updatePreview(elapsed) {
+    if (!this._preview) return;
+    const { group, body, kit } = this._preview;
+    // Медленный полуоборот: видно и лицо, и силуэт со спины.
+    group.rotation.y = Math.sin(elapsed * 0.45) * 0.42;
+    if (body) body.position.y = 0.82 + Math.sin(elapsed * 1.6) * 0.01;
+    if (kit && kit.tvScreen) {
+      kit.tvScreen.material.emissiveIntensity = 0.7 + Math.abs(Math.sin(elapsed * 9.3)) * 1.1;
+    }
   }
 }
 
@@ -7269,14 +8422,16 @@ const DEMON_BLOOD_EMISSIVE = new THREE.Color(0x520602);
 class PassengerNPC {
   static POSES = {
     seated: {
-      hipY: 0.53, bodyX: 0.16, bodyZ: 0.02, headX: 0.52, headY: 0,
+      // hipY подобран под высоту скамьи (0.47 м): бёдра лежат на сиденье,
+      // а не висят над ним, как в присяде.
+      hipY: 0.47, bodyX: 0.16, bodyZ: 0.02, headX: 0.52, headY: 0,
       armX: -0.3, armZ: 0.06, elbowX: -1.2,
-      thighX: -1.5, kneeX: 1.5, footX: 0.12,
+      thighX: -1.44, kneeX: 1.42, footX: 0.12,
     },
     waking: {
-      hipY: 0.53, bodyX: 0.02, bodyZ: 0.05, headX: 0.06, headY: 0,
+      hipY: 0.47, bodyX: 0.02, bodyZ: 0.05, headX: 0.06, headY: 0,
       armX: -0.52, armZ: 0.08, elbowX: -1.32,
-      thighX: -1.5, kneeX: 1.5, footX: 0.12,
+      thighX: -1.44, kneeX: 1.42, footX: 0.12,
     },
     ragdoll: {
       hipY: 0.17, bodyX: 1.34, bodyZ: 0.24, headX: -0.22, headY: 0.4,
@@ -7345,12 +8500,19 @@ class PassengerNPC {
   }
 
   _build() {
-    const coat = this._material(0x5a5c57, { roughness: 0.96, weight: 1, glow: 0.5 });
-    const coatDark = this._material(0x3b3e3a, { roughness: 0.94, weight: 1, glow: 0.36 });
-    const trousers = this._material(0x33352f, { roughness: 0.97, weight: 1, glow: 0.3 });
-    const porcelain = this._material(0xd7d0bd, { roughness: 0.46, metalness: 0.02, weight: 1, glow: 0.8 });
+    // Пятый пассажир собран из тех же деталей, что и обычные пассажиры:
+    // пальто, шапка, шарф. Он просто выше и шире — и лицо у него не такое.
+    const coat = this._material(0x585a52, { roughness: 0.96, weight: 1, glow: 0.5 });
+    const coatDark = this._material(0x393b35, { roughness: 0.94, weight: 1, glow: 0.36 });
+    const trousers = this._material(0x31332d, { roughness: 0.97, weight: 1, glow: 0.3 });
+    const porcelain = this._material(0xd8d1bd, { roughness: 0.46, metalness: 0.02, weight: 1, glow: 0.8 });
     const hair = this._material(0x242723, { roughness: 0.9, weight: 1, glow: 0.2 });
     const leather = this._material(0x26221e, { roughness: 0.62, metalness: 0.12, weight: 1, glow: 0.24 });
+    const brass = this._material(0x8a7a48, { roughness: 0.35, metalness: 0.85, weight: 0.6, glow: 0.3 });
+    const scarf = this._material(0x6a2c26, { roughness: 0.94, weight: 1, glow: 0.3 });
+
+    // Он заметно крупнее пассажиров — но всё ещё человек в пальто.
+    this.root.scale.setScalar(1.12);
 
     this.hips = new THREE.Group();
     this.hips.position.y = this.seat.y + 0.06;
@@ -7359,85 +8521,78 @@ class PassengerNPC {
     this.body = new THREE.Group();
     this.hips.add(this.body);
 
-    // Пальто / торс.
-    this._add(new THREE.BoxGeometry(0.43, 0.63, 0.3), coat, this.body, 0, 0.33, 0);
-    // Полы пальто — фигура перестаёт быть «коробкой».
-    const tail = this._add(new THREE.BoxGeometry(0.44, 0.34, 0.06), coatDark, this.body, 0, -0.03, -0.14);
-    tail.rotation.x = -0.14;
-    // Нагрудный карман и пуговицы.
-    this._add(new THREE.BoxGeometry(0.12, 0.06, 0.02), coatDark, this.body, -0.09, 0.42, 0.153);
+    // Торс, полы пальто, воротник.
+    this._add(new THREE.CapsuleGeometry(0.25, 0.42, 4, 12), coat, this.body, 0, 0.33, 0);
+    const tail = this._add(new THREE.BoxGeometry(0.46, 0.4, 0.08), coatDark, this.body, 0, -0.05, -0.15);
+    tail.rotation.x = -0.16;
+    this._add(new THREE.BoxGeometry(0.52, 0.1, 0.28), coat, this.body, 0, 0.55, 0);
+    this._add(new THREE.TorusGeometry(0.17, 0.05, 8, 16), scarf, this.body, 0, 0.62, 0, Math.PI / 2);
+    // Борт и пуговицы.
+    this._add(new THREE.BoxGeometry(0.06, 0.44, 0.02), coatDark, this.body, 0.01, 0.3, 0.2);
     for (let i = 0; i < 3; i += 1) {
-      this._add(new THREE.SphereGeometry(0.015, 7, 5), leather, this.body, 0.05, 0.18 + i * 0.12, 0.156);
+      this._add(new THREE.SphereGeometry(0.016, 7, 5), brass, this.body, 0.05, 0.18 + i * 0.13, 0.205);
     }
-    // Борт пальто и воротник.
-    this._add(new THREE.BoxGeometry(0.08, 0.5, 0.02), coatDark, this.body, 0, 0.31, 0.155);
-    this._add(new THREE.BoxGeometry(0.3, 0.08, 0.26), coatDark, this.body, 0, 0.625, 0);
-    // Шарф.
-    this._add(new THREE.BoxGeometry(0.24, 0.09, 0.22), leather, this.body, 0, 0.585, 0.02);
-    // Плечи.
-    this._add(new THREE.BoxGeometry(0.5, 0.1, 0.27), coat, this.body, 0, 0.55, 0);
+    this._add(new THREE.BoxGeometry(0.13, 0.07, 0.02), coatDark, this.body, -0.1, 0.42, 0.2);
 
     // Голова.
     this.head = new THREE.Group();
     this.head.position.set(0, 0.66, 0);
     this.body.add(this.head);
-    this._add(new THREE.CylinderGeometry(0.055, 0.06, 0.1, 8), porcelain, this.head, 0, 0.02, 0);
-    this._add(new THREE.SphereGeometry(0.132, 16, 12), porcelain, this.head, 0, 0.205, 0);
-    // Фарфоровая маска: гладкая лицевая пластина без рта.
-    this._add(new THREE.CylinderGeometry(0.118, 0.105, 0.1, 14, 1, false, 0, Math.PI * 2), porcelain, this.head, 0, 0.205, 0.055, Math.PI / 2, 0, 0);
-    // Глазные впадины — две чёрные щели.
-    this._add(new THREE.BoxGeometry(0.052, 0.018, 0.02), leather, this.head, -0.048, 0.225, 0.112);
-    this._add(new THREE.BoxGeometry(0.052, 0.018, 0.02), leather, this.head, 0.048, 0.225, 0.112);
-    // Волосы/кепка.
-    this._add(new THREE.SphereGeometry(0.14, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2), hair, this.head, 0, 0.235, -0.01);
-    this._add(new THREE.CylinderGeometry(0.155, 0.155, 0.022, 16), hair, this.head, 0, 0.3, 0.01);
-    // Кокарда проводника.
+    this._add(new THREE.CylinderGeometry(0.06, 0.065, 0.1, 8), porcelain, this.head, 0, 0.02, 0);
+    this._add(new THREE.SphereGeometry(0.138, 16, 12), porcelain, this.head, 0, 0.2, 0);
+    // Лицо-маска: гладкая пластина без рта, глаза — щели.
+    this._add(
+      new THREE.CylinderGeometry(0.122, 0.108, 0.11, 16, 1, false, 0, Math.PI * 2),
+      porcelain,
+      this.head,
+      0, 0.2, 0.058,
+      Math.PI / 2,
+    );
+    this._add(new THREE.BoxGeometry(0.052, 0.016, 0.02), leather, this.head, -0.05, 0.222, 0.118);
+    this._add(new THREE.BoxGeometry(0.052, 0.016, 0.02), leather, this.head, 0.05, 0.222, 0.118);
+    // Кепка проводника с кокардой: он ведь тоже ехал в этом поезде.
+    this._add(new THREE.SphereGeometry(0.145, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2), hair, this.head, 0, 0.235, -0.005);
+    this._add(new THREE.CylinderGeometry(0.16, 0.16, 0.024, 16), hair, this.head, 0, 0.3, 0.015);
+    this._add(new THREE.BoxGeometry(0.26, 0.02, 0.13), leather, this.head, 0, 0.29, 0.15);
     this._add(
       new THREE.CylinderGeometry(0.026, 0.026, 0.01, 10),
-      this._material(0x8a7a48, { roughness: 0.35, metalness: 0.85, weight: 0.6, glow: 0.3 }),
+      brass,
       this.head,
-      0,
-      0.312,
-      0.11,
+      0, 0.33, 0.11,
       Math.PI / 2,
     );
 
-    // Глаза: в обычной личине погашены, после пробуждения — красные.
+    // Глаза: в личине погашены, после пробуждения — красные.
     this.eyeMaterial = new THREE.MeshStandardMaterial({
       color: 0x120504,
       emissive: 0xff2408,
       emissiveIntensity: 0,
       roughness: 0.3,
     });
-    this._add(new THREE.SphereGeometry(0.017, 8, 6), this.eyeMaterial, this.head, -0.048, 0.226, 0.118);
-    this._add(new THREE.SphereGeometry(0.017, 8, 6), this.eyeMaterial, this.head, 0.048, 0.226, 0.118);
+    this._add(new THREE.SphereGeometry(0.018, 8, 6), this.eyeMaterial, this.head, -0.05, 0.223, 0.122);
+    this._add(new THREE.SphereGeometry(0.018, 8, 6), this.eyeMaterial, this.head, 0.05, 0.223, 0.122);
 
-    // Руки.
+    // Руки. Кисти с шестью пальцами — та самая деталь.
     const buildArm = (side) => {
       const shoulder = new THREE.Group();
-      shoulder.position.set(side * 0.255, 0.53, 0);
+      shoulder.position.set(side * 0.27, 0.52, 0);
       this.body.add(shoulder);
-      this._add(new THREE.CapsuleGeometry(0.056, 0.24, 3, 8), coat, shoulder, 0, -0.15, 0);
+      this._add(new THREE.CapsuleGeometry(0.06, 0.26, 3, 8), coat, shoulder, 0, -0.16, 0);
       const elbow = new THREE.Group();
-      elbow.position.set(0, -0.3, 0);
+      elbow.position.set(0, -0.32, 0);
       shoulder.add(elbow);
-      this._add(new THREE.CapsuleGeometry(0.048, 0.2, 3, 8), coatDark, elbow, 0, -0.14, 0);
-      this._add(new THREE.CylinderGeometry(0.05, 0.054, 0.04, 10), coatDark, elbow, 0, -0.245, 0.005);
-      const palm = this._add(new THREE.SphereGeometry(0.052, 12, 9), porcelain, elbow, 0, -0.29, 0.012);
+      this._add(new THREE.CapsuleGeometry(0.05, 0.22, 3, 8), coatDark, elbow, 0, -0.14, 0);
+      this._add(new THREE.CylinderGeometry(0.052, 0.056, 0.04, 10), coatDark, elbow, 0, -0.26, 0.005);
+      const palm = this._add(new THREE.SphereGeometry(0.056, 12, 9), porcelain, elbow, 0, -0.3, 0.012);
       palm.scale.set(1, 0.78, 1.15);
-      // Шесть пальцев: главная деталь, по которой его узнают.
       for (let finger = 0; finger < 6; finger += 1) {
-        const spread = (finger - 2.5) * 0.019;
+        const spread = (finger - 2.5) * 0.02;
         this._add(
-          new THREE.CapsuleGeometry(0.0085, 0.055, 2, 5),
+          new THREE.CapsuleGeometry(0.009, 0.06, 2, 5),
           porcelain,
           elbow,
-          spread,
-          -0.325,
-          0.038,
-          0.5,
-          0,
-          spread * 1.6,
+          spread, -0.34, 0.04,
+          0.5, 0, spread * 1.6,
         );
       }
       return { shoulder, elbow };
@@ -7452,14 +8607,14 @@ class PassengerNPC {
     // Ноги.
     const buildLeg = (side) => {
       const hip = new THREE.Group();
-      hip.position.set(side * 0.105, 0, 0);
+      hip.position.set(side * 0.11, 0, 0);
       this.hips.add(hip);
-      this._add(new THREE.CapsuleGeometry(0.075, 0.26, 3, 8), trousers, hip, 0, -0.2, 0);
+      this._add(new THREE.CapsuleGeometry(0.08, 0.28, 3, 8), trousers, hip, 0, -0.2, 0);
       const knee = new THREE.Group();
-      knee.position.set(0, -0.4, 0);
+      knee.position.set(0, -0.42, 0);
       hip.add(knee);
-      this._add(new THREE.CapsuleGeometry(0.062, 0.3, 3, 8), trousers, knee, 0, -0.23, 0);
-      const foot = this._add(new THREE.BoxGeometry(0.13, 0.075, 0.25), leather, knee, 0, -0.455, 0.06);
+      this._add(new THREE.CapsuleGeometry(0.066, 0.32, 3, 8), trousers, knee, 0, -0.24, 0);
+      const foot = this._add(new THREE.BoxGeometry(0.14, 0.08, 0.27), leather, knee, 0, -0.47, 0.07);
       return { hip, knee, foot };
     };
     const legLeft = buildLeg(-1);
@@ -7471,21 +8626,21 @@ class PassengerNPC {
     this.kneeR = legRight.knee;
     this.footR = legRight.foot;
 
-    // Тень-пятно под телом: без неё в темноте фигура «висит».
+    // Тень под телом.
     const shadowMaterial = new THREE.MeshBasicMaterial({
       color: 0x000000,
       transparent: true,
       opacity: 0.5,
       depthWrite: false,
     });
-    this.shadow = new THREE.Mesh(new THREE.CircleGeometry(0.38, 20), shadowMaterial);
+    this.shadow = new THREE.Mesh(new THREE.CircleGeometry(0.42, 20), shadowMaterial);
     this.shadow.rotation.x = -Math.PI / 2;
     this.shadow.position.y = 0.012;
     this.root.add(this.shadow);
 
     // Метка захвата.
     this.marker = new THREE.Mesh(
-      new THREE.RingGeometry(0.3, 0.36, 26),
+      new THREE.RingGeometry(0.32, 0.38, 26),
       new THREE.MeshBasicMaterial({
         color: 0xb9f7a4,
         transparent: true,
@@ -7499,18 +8654,17 @@ class PassengerNPC {
     this.marker.visible = false;
     this.root.add(this.marker);
 
-    // Красное свечение вокруг тела после пробуждения.
+    // Красное свечение после пробуждения.
     this.aura = new THREE.PointLight(0xff2a12, 0, 4.6, 2);
     this.aura.position.set(0, 1.15, 0);
     this.root.add(this.aura);
 
-    // Единый объём для захвата и проверки билета: тонкие детали модели
-    // оставляют зазоры, из-за которых луч проходит мимо.
+    // Объём для захвата и проверки билета: тонкие детали оставляют зазоры.
     const grabBox = new THREE.Mesh(
-      new THREE.BoxGeometry(0.72, 1.55, 0.66),
+      new THREE.BoxGeometry(0.78, 1.6, 0.72),
       new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
     );
-    grabBox.position.set(0, 0.82, 0.06);
+    grabBox.position.set(0, 0.86, 0.05);
     this.root.add(grabBox);
     this.hitMeshes.push(grabBox);
   }
@@ -7566,6 +8720,29 @@ class PassengerNPC {
 
   setHighlight(on) {
     if (this.marker) this.marker.visible = Boolean(on);
+  }
+
+  /** Верёвка на теле: видно, что он связан. */
+  setRope(on) {
+    if (on && !this.rope) {
+      this.rope = new THREE.Mesh(
+        new THREE.TorusGeometry(0.26, 0.03, 7, 18),
+        new THREE.MeshStandardMaterial({ color: 0x8a7448, roughness: 0.95 }),
+      );
+      this.rope.rotation.x = Math.PI / 2;
+      this.rope.position.y = 0.34;
+      this.body.add(this.rope);
+      this.rope2 = this.rope.clone();
+      this.rope2.position.y = 0.46;
+      this.body.add(this.rope2);
+    } else if (!on && this.rope) {
+      this.body.remove(this.rope);
+      this.body.remove(this.rope2);
+      this.rope.geometry.dispose();
+      this.rope.material.dispose();
+      this.rope = null;
+      this.rope2 = null;
+    }
   }
 
   _applyJoints() {
@@ -8007,6 +9184,7 @@ class DemonDirector {
     this._dragHelpers = new Set();
     this._dragStartedAt = 0;
     this._deadIds = new Set();
+    this._downedIds = new Set();
     this._killed = false;
     this._guestHuntAnnounced = false;
     this._selfPos = new THREE.Vector3();
@@ -8016,6 +9194,7 @@ class DemonDirector {
     // только видимость и то, кто в каком вагоне находится.
     this.carIndex = 0;
     this.localCar = 0;
+    this.localZone = 'car';
     this._transferTimer = 0;
     this._escaping = false;
     this._stuckTime = 0;
@@ -8045,6 +9224,7 @@ class DemonDirector {
     this._draggingId = null;
     this._dragHelpers.clear();
     this._deadIds.clear();
+    this._downedIds.clear();
     this._killed = false;
     this._guestHuntAnnounced = false;
     this._rayTarget = null;
@@ -8053,6 +9233,7 @@ class DemonDirector {
     this._escaping = false;
     this._stuckTime = 0;
     this._escapeSent = false;
+    this._thrown = false;
     this.player.setSpeedScale(1);
     this.world.setBlackout(false);
     this.ui.setScare(false);
@@ -8077,6 +9258,7 @@ class DemonDirector {
     this._escaping = false;
     this._stuckTime = 0;
     this._escapeSent = false;
+    this._thrown = false;
     this.player.setSpeedScale(1);
     this.world.setBlackout(false);
     this.ui.setScare(false);
@@ -8094,6 +9276,11 @@ class DemonDirector {
     this._rayTarget = null;
     this.npc.setHighlight(false);
     this.ui.hidePrompt(20);
+  }
+
+  /** Игрок ушёл в тамбур: демон не может туда зайти. */
+  setLocalZone(zone) {
+    this.localZone = zone === 'vestibule' ? 'vestibule' : 'car';
   }
 
   _syncVisibility() {
@@ -8280,33 +9467,34 @@ class DemonDirector {
   }
 
   _updatePrompt() {
+    const owner = 'demon';
     if (this.phase === DEMON_PHASE.STUNNED) {
       const selfId = this._selfId();
       if (this._draggingId === selfId) {
         const help = this._dragHelpers.size ? ' // ВДВОЁМ БЫСТРЕЕ' : '';
-        this.ui.showPrompt(`ОТПУСТИТЕ E — БРОСИТЬ ТЕЛО${help}`, 'E', 'danger', 20);
+        this.ui.setHint(owner, { text: `ОТПУСТИТЕ E — БРОСИТЬ ТЕЛО${help}`, key: 'E', tone: 'danger', priority: 20 });
       } else if (this._draggingId && this._npcDistance <= CONFIG.npc.grabDistance + 0.8) {
-        this.ui.showPrompt('УДЕРЖИВАЙТЕ E — ПОМОЧЬ НЕСТИ', 'E', 'normal', 20);
+        this.ui.setHint(owner, { text: 'УДЕРЖИВАЙТЕ E — ПОМОЧЬ НЕСТИ', key: 'E', tone: 'normal', priority: 20 });
       } else if (!this._draggingId && this._npcDistance <= CONFIG.npc.grabDistance + 0.5) {
-        this.ui.showPrompt('УДЕРЖИВАЙТЕ E — ТАЩИТЬ ТЕЛО', 'E', 'danger', 20);
+        this.ui.setHint(owner, { text: 'УДЕРЖИВАЙТЕ E — ТАЩИТЬ ТЕЛО', key: 'E', tone: 'danger', priority: 20 });
       } else {
-        this.ui.hidePrompt(20);
+        this.ui.clearHint(owner);
       }
       return;
     }
     if (!this._rayTarget) {
-      this.ui.hidePrompt(20);
+      this.ui.clearHint(owner);
       return;
     }
     if (this.phase === DEMON_PHASE.INCOGNITO) {
       if (this._npcDistance <= CONFIG.npc.grabDistance) {
-        this.ui.showPrompt('ПРОВЕРИТЬ БИЛЕТ ПАССАЖИРА', 'E', 'normal', 20);
+        this.ui.setHint(owner, { text: 'ПРОВЕРИТЬ БИЛЕТ ПАССАЖИРА', key: 'E', tone: 'normal', priority: 20 });
       } else {
-        this.ui.showPrompt('ПОДОЙДИТЕ БЛИЖЕ', '', 'normal', 20);
+        this.ui.setHint(owner, { text: 'ПОДОЙДИТЕ БЛИЖЕ', key: '', tone: 'normal', priority: 20 });
       }
       return;
     }
-    this.ui.hidePrompt(20);
+    this.ui.clearHint(owner);
   }
 
   // ---------------------------------------------------------------------------
@@ -8425,6 +9613,22 @@ class DemonDirector {
     this._placeBody(pose, dt);
   }
 
+  /** Тело в руках переезжает вместе с проводником (переход через дверь). */
+  followLocalPlayer() {
+    if (!this._draggingId) return;
+    const pose = this._playerPose(this._draggingId);
+    if (!pose) return;
+    const forwardX = -Math.sin(pose.yaw);
+    const forwardZ = -Math.cos(pose.yaw);
+    const bounds = this.world.bounds;
+    this.npc.root.position.set(
+      clamp(pose.x + forwardX * CONFIG.npc.dragOffset, bounds.minX + CONFIG.demon.bodyRadius, bounds.maxX - CONFIG.demon.bodyRadius),
+      0,
+      clamp(pose.z + forwardZ * CONFIG.npc.dragOffset, bounds.minZ + CONFIG.demon.bodyRadius, bounds.maxZ - CONFIG.demon.bodyRadius),
+    );
+    this.npc.setYaw(pose.yaw + Math.PI, true);
+  }
+
   _placeBody(pose, dt) {
     const yaw = pose.yaw;
     const forwardX = -Math.sin(yaw);
@@ -8486,7 +9690,7 @@ class DemonDirector {
     const dz = target.z - npc.z;
     const distance = Math.hypot(dx, dz);
     if (distance <= CONFIG.demon.killDistance) {
-      this._kill(target);
+      this._catch(target);
       return;
     }
 
@@ -8509,7 +9713,7 @@ class DemonDirector {
     }
 
     const after = Math.hypot(target.x - npc.x, target.z - npc.z);
-    if (after <= CONFIG.demon.killDistance) this._kill(target);
+    if (after <= CONFIG.demon.killDistance) this._catch(target);
   }
 
   _advance(target, step) {
@@ -8584,17 +9788,90 @@ class DemonDirector {
     npc.x += Math.sign(aisle - npc.x || 1) * step * 0.5;
   }
 
-  _kill(target) {
-    if (this._killed || this.phase === DEMON_PHASE.DEAD) return;
-    this._killed = true;
-    const name = target.name || 'ПАССАЖИР';
-    this._deadIds.add(target.id);
-    this.network.sendDemon({ kind: 'kill', target: target.id, name });
+  /** Касание: игрок падает и лежит на полу, пока его не поднимут бинтом. */
+  _catch(target) {
+    if (this.phase === DEMON_PHASE.DEAD) return;
+    if (this._downedIds.has(target.id)) return;
+    this._downedIds.add(target.id);
+    this.network.sendDemon({ kind: 'downed', target: target.id, name: target.name });
+    this._applyDowned(target.id);
     this._endDrag({ silent: true, all: true });
+    this._stateClock = 0;
+
+    // Демон не добивает: он идёт за следующим. Если упали все — смена проиграна.
+    const alive = this._allPlayers().filter((player) => !this._downedIds.has(player.id)
+      && !this._deadIds.has(player.id) && player.zone !== 'vestibule');
+    if (!alive.length) {
+      this.phase = DEMON_PHASE.DEAD;
+      this.npc.setPose('hunt');
+      this.onGameOver({ all: true });
+      this.bus.emit('demon:phase', { phase: this.phase });
+    }
+  }
+
+  /** Общий обработчик падения: и для гостя, и для локального игрока. */
+  _applyDowned(id) {
+    if (!id) return;
+    this._downedIds.add(id);
+    if (id === this._selfId()) {
+      this.player.setSpeedScale(1);
+      this.bus.emit('player:downed', {});
+    }
+  }
+
+  /** Подъём бинтом: себя или напарника. */
+  reviveTarget(id) {
+    if (!id) return;
+    this._downedIds.delete(id);
+    this.network.sendDemon({ kind: 'revive', target: id });
+    if (id === this._selfId()) this.bus.emit('player:revived', {});
+  }
+
+  /** Шокер: падение на несколько секунд. */
+  taserHit() {
+    if (this.phase !== DEMON_PHASE.HUNTING && this.phase !== DEMON_PHASE.INCOGNITO) return false;
+    if (this._isHost()) {
+      this._hostStun(CONFIG.items.taser.stun, 'taser');
+      this.network.sendDemon({ kind: 'stun', seconds: CONFIG.items.taser.stun, source: 'taser' });
+      return true;
+    }
+    this.network.sendDemon({ kind: 'taser' });
+    return true;
+  }
+
+  _hostStun(seconds, source) {
+    if (this.phase === DEMON_PHASE.DEAD) return;
+    if (this.phase === DEMON_PHASE.INCOGNITO) this._applyReveal(source || 'ticket', true);
+    this.phase = DEMON_PHASE.STUNNED;
+    this._stunTimer = Math.max(this._stunTimer, seconds);
+    this._killed = false;
+    this.npc.setPose('ragdoll');
+    this.ui.setScare(true);
+    this.world.setBlackout(true);
+    this._stateClock = 0;
+    this.bus.emit('demon:phase', { phase: this.phase });
+  }
+
+  /** Верёвка: продлевает беспамятство, чтобы успеть дотащить тело. */
+  applyRope() {
+    if (this.phase !== DEMON_PHASE.STUNNED) return;
+    this._stunTimer += CONFIG.items.rope.bonus;
+    this.npc.setRope(true);
+    this.network.sendDemon({ kind: 'rope' });
+    this.ui.showToast('ОН СВЯЗАН // ТЕЛО ТЯЖЕЛЕЕ, НО ВРЕМЕНИ БОЛЬШЕ', 'success', 3000);
+  }
+
+  /** Сброс за борт из тамбура — победа. */
+  throwOut() {
+    if (this.phase === DEMON_PHASE.DEAD || this._thrown) return;
+    this._thrown = true;
     this.phase = DEMON_PHASE.DEAD;
-    this.npc.setPose('hunt');
-    // Игра заканчивается для всего экипажа: это хоррор, а не аркада.
-    this.onGameOver({ target: target.id, name });
+    this._endDrag({ silent: true, all: true });
+    this.npc.setRope(false);
+    this.npc.setPose('ragdoll');
+    this.npc.root.visible = false;
+    this.network.sendDemon({ kind: 'thrown' });
+    this.bus.emit('demon:thrown', {});
     this.bus.emit('demon:phase', { phase: this.phase });
   }
 
@@ -8657,6 +9934,8 @@ class DemonDirector {
       z: this.player.position.z,
       yaw: this._cameraYaw(),
       car: this.localCar,
+      zone: this.localZone,
+      downed: this._downedIds.has(this._selfId()),
       name: this._nameOf(this._selfId()),
     }];
     if (!this.network.remoteStates) return list;
@@ -8670,6 +9949,8 @@ class DemonDirector {
         z: Number(entry.s.z) || 0,
         yaw: Number(entry.s.yaw) || 0,
         car: Number(entry.s.car) || 0,
+        zone: entry.s.zone === 'vestibule' ? 'vestibule' : 'car',
+        downed: Boolean(entry.s.d),
         name: this._nameOf(id),
       });
     }
@@ -8681,7 +9962,9 @@ class DemonDirector {
     let best = null;
     let bestDistance = Infinity;
     for (const player of this._allPlayers()) {
-      if (this._deadIds.has(player.id)) continue;
+      if (this._deadIds.has(player.id) || this._downedIds.has(player.id)) continue;
+      // В тамбуре игрока не достать: демон ждёт у двери.
+      if (player.zone === 'vestibule') continue;
       const distance = Math.hypot(player.x - npc.x, player.z - npc.z);
       if (distance < bestDistance) {
         bestDistance = distance;
@@ -8741,6 +10024,18 @@ class DemonDirector {
       } else if (data.kind === 'ticket') {
         // Гость проверил билет — раздаём всем, чтобы счётчик совпадал.
         this.network.sendDemon({ kind: 'ticket', index: data.index, from: data.from });
+      } else if (data.kind === 'taser') {
+        this._hostStun(CONFIG.items.taser.stun, 'taser');
+        this.network.sendDemon({ kind: 'stun', seconds: CONFIG.items.taser.stun, source: 'taser' });
+      } else if (data.kind === 'rope') {
+        this._stunTimer += CONFIG.items.rope.bonus;
+        this.npc.setRope(true);
+        this.network.sendDemon({ kind: 'rope' });
+      } else if (data.kind === 'revive') {
+        this.network.sendDemon({ kind: 'revive', target: data.target, from: data.from });
+        if (data.target === this._selfId()) this.bus.emit('player:revived', {});
+      } else if (data.kind === 'thrown') {
+        this.throwOut();
       }
       return;
     }
@@ -8759,6 +10054,35 @@ class DemonDirector {
     }
     if (data.kind === 'escape') {
       this._finishEscape();
+      return;
+    }
+    if (data.kind === 'stun') {
+      if (this.phase === DEMON_PHASE.DEAD) return;
+      if (this.phase === DEMON_PHASE.INCOGNITO) this._applyReveal('taser', true);
+      this.phase = DEMON_PHASE.STUNNED;
+      this._stunTimer = Math.max(this._stunTimer, Number(data.seconds) || CONFIG.items.taser.stun);
+      this.npc.setPose('ragdoll');
+      this.ui.setScare(true);
+      this.world.setBlackout(true);
+      return;
+    }
+    if (data.kind === 'rope') {
+      this._stunTimer += CONFIG.items.rope.bonus;
+      this.npc.setRope(true);
+      return;
+    }
+    if (data.kind === 'downed') {
+      this._applyDowned(data.target);
+      return;
+    }
+    if (data.kind === 'revive') {
+      if (data.target === this._selfId()) this.bus.emit('player:revived', {});
+      return;
+    }
+    if (data.kind === 'thrown') {
+      this.phase = DEMON_PHASE.DEAD;
+      this.npc.root.visible = false;
+      this.bus.emit('demon:thrown', {});
       return;
     }
     if (data.kind === 'kill') {
@@ -9058,7 +10382,7 @@ class TicketInspector {
     if (!enabled) {
       if (this._target) this._target.setHighlight(false);
       this._target = null;
-      this.ui.hidePrompt(15);
+      this.ui.clearHint('ticket');
       return;
     }
 
@@ -9092,18 +10416,18 @@ class TicketInspector {
     this._targetDistance = distance;
 
     if (!closest) {
-      this.ui.hidePrompt(15);
+      this.ui.clearHint('ticket');
       return;
     }
     if (closest.checked) {
-      this.ui.showPrompt(`БИЛЕТ ПРОВЕРЕН // ${closest.seat.name}`, '', 'normal', 15);
+      this.ui.setHint('ticket', { text: `БИЛЕТ ПРОВЕРЕН // ${closest.seat.name}`, key: '', priority: 15 });
       return;
     }
     if (distance > CONFIG.mission.interactDistance) {
-      this.ui.showPrompt('ПОДОЙДИТЕ К ПАССАЖИРУ', '', 'normal', 15);
+      this.ui.setHint('ticket', { text: 'ПОДОЙДИТЕ К ПАССАЖИРУ', key: '', priority: 15 });
       return;
     }
-    this.ui.showPrompt('ПРОВЕРИТЬ БИЛЕТ', 'E', 'normal', 15);
+    this.ui.setHint('ticket', { text: 'ПРОВЕРИТЬ БИЛЕТ', key: 'E', priority: 15 });
   }
 
   _onInteract({ held } = {}) {
@@ -9122,7 +10446,7 @@ class TicketInspector {
       note: 'Штамп проводника поставлен. Смена идёт по расписанию.',
       invalid: false,
     });
-    this.ui.hidePrompt(15);
+    this.ui.clearHint('ticket');
     this.bus.emit('ticket:checked', { index: passenger.index, name: passenger.seat.name, seat: passenger.seat.seat });
     if (this.onCheck) this.onCheck(passenger);
   }
@@ -9212,13 +10536,17 @@ class MissionDirector {
     this.bus.on('ticket:checked', ({ index } = {}) => this._markTicket(index));
     this.bus.on('ticket:remote', ({ index } = {}) => this._markTicket(index));
     this.bus.on('demon:awakened', ({ source } = {}) => this._onAwakened(source));
-    this.bus.on('demon:escape', () => this._onEscape());
+    this.bus.on('demon:phase', ({ phase } = {}) => this._onDemonPhase(phase));
+    this.bus.on('zone:changed', ({ zone } = {}) => this._onZone(zone));
+    this.bus.on('demon:thrown', () => this._onThrown());
+    this.bus.on('demon:escape', () => this._onThrown());
   }
 
   begin() {
     this.started = true;
     this.checked.clear();
     this.step = 0;
+    this.won = false;
     this._render();
     this.openBriefing();
   }
@@ -9261,7 +10589,7 @@ class MissionDirector {
         seat: '№ 05',
         serial: '—',
         status: 'НЕТ БИЛЕТА',
-        note: 'Штампа нет. На левой руке шесть пальцев. Он уже смотрит на вас.',
+        note: 'Штампа нет. На левой руке шесть пальцев. Он падает — но ненадолго.',
         invalid: true,
         seconds: 6.5,
       });
@@ -9270,15 +10598,35 @@ class MissionDirector {
     this._render();
   }
 
-  onCarChanged(index) {
-    if (index === 1 && this.step === 2) {
+  _onDemonPhase(phase) {
+    if (phase === 'stunned' && this.step === 2) {
+      this.step = 3;
+      this._render();
+    }
+    if (phase === 'dead' && this.step >= 2 && this.step < 5) {
+      // Победа приходит отдельным событием demon:thrown.
+    }
+  }
+
+  _onZone(zone) {
+    if (zone === 'vestibule' && this.step >= 2 && this.step < 5) {
+      this.step = 4;
+      this._render();
+    }
+  }
+
+  /** Переход в соседний вагон: задача меняется на «донести тело до тамбура». */
+  onCarChanged(car) {
+    if (!this.started) return;
+    if (car === 1 && this.step === 2) {
       this.step = 3;
       this._render();
     }
   }
 
-  _onEscape() {
-    this.step = 4;
+  _onThrown() {
+    this.step = 5;
+    this.won = true;
     this._render();
   }
 
@@ -9306,88 +10654,192 @@ class MissionDirector {
     }
     if (this.step === 2) {
       this.ui.setObjective({
-        text: 'БЕГИТЕ В СОСЕДНИЙ ВАГОН // СОРВИТЕ ТОРМОЗ',
-        progress: 'ОН ИДЁТ ЗА ВАМИ',
+        text: 'ОН ОГЛУШЁН // ДЕРЖИТЕ E',
+        progress: 'ВЕРЁВКА (3) ДАЁТ +32 С НА ПЕРЕНОСКУ',
         danger: true,
       });
       return;
     }
     if (this.step === 3) {
       this.ui.setObjective({
-        text: 'СОРВИТЕ ТОРМОЗНОЙ КРАН У ДВЕРИ',
-        progress: 'УДЕРЖИВАЙТЕ E',
+        text: 'ДОТАЩИТЕ ЕГО В ТАМБУР',
+        progress: 'ДВЕРЬ В КОНЦЕ САЛОНА, ДАЛЬШЕ — НАЛЕВО К ЛАЗУ',
+        danger: true,
+      });
+      return;
+    }
+    if (this.step === 4) {
+      this.ui.setObjective({
+        text: 'СБРОСЬТЕ ЕГО С ПОЕЗДА',
+        progress: 'У БОРТА ТАМБУРА ДЕРЖИТЕ E',
         danger: true,
       });
       return;
     }
     this.ui.setObjective({
-      text: 'ТОРМОЗ СОРВАН // СМЕНА ОКОНЧЕНА',
+      text: 'ОН ЗА БОРТОМ // СМЕНА ОКОНЧЕНА',
       progress: '',
       danger: false,
     });
   }
 }
 
-/** Переход между вагонами: дверь в конце салона. */
-class DoorDirector {
-  constructor({ camera, player, ui, bus, getCar, onSwitch }) {
-    this.camera = camera;
+/**
+ * Переходы: салон → тамбур → соседний вагон.
+ * Работают автоматически, когда игрок входит в дверной проём: никаких
+ * «нажмите E, глядя точно в дверь». Экран на миг затемняется, чтобы
+ * переход читался как шаг через тамбур, а не как телепорт.
+ */
+/**
+ * Салон ↔ тамбур ↔ соседний вагон.
+ *
+ * Переход — это дверь, а не невидимая линия: игрок видит подсказку «E»,
+ * створки разъезжаются, и только после нажатия происходит перенос.
+ * Тамбур — буферная зона: там не достаёт демон, стоит автомат и есть лаз,
+ * через который тело сбрасывают с поезда.
+ */
+class ZoneDirector {
+  // Точки появления. Обе двери ведут на южный конец вагона: тамбур один
+  // и всегда «между» двумя вагонами.
+  static SPAWN = {
+    vestibule: { x: 0, z: -17.35, yaw: 0 },          // вошли из вагона, лицом в тамбур (−Z)
+    car: { x: 0, z: -14.15, yaw: Math.PI },          // вернулись в вагон, лицом в салон (+Z)
+    nextCar: { x: 0, z: -13.55, yaw: Math.PI },      // вошли в соседний вагон
+  };
+
+  constructor({ player, ui, bus, getCar, onSwitchCar, onEnterVestibule, onLeaveVestibule }) {
     this.player = player;
     this.ui = ui;
     this.bus = bus;
     this.getCar = getCar;
-    this.onSwitch = onSwitch;
-    this._direction = new THREE.Vector3();
+    this.onSwitchCar = onSwitchCar;
+    this.onEnterVestibule = onEnterVestibule;
+    this.onLeaveVestibule = onLeaveVestibule;
+    this.zone = 'car';
     this._cooldown = 0;
-    this._active = false;
-    this._target = 0;
-    this.bus.on('player:interact', ({ held } = {}) => this._onInteract(held));
+    this._fading = false;
+    this._armed = true;
+    this._armTimer = 0;
+    this._autoDragTimer = 0;
+    this._hint = '';
+  }
+
+  reset() {
+    this.zone = 'car';
+    this._cooldown = 0;
+    this._fading = false;
+    this._armed = true;
+    this._armTimer = 0;
+    this._autoDragTimer = 0;
+    this.ui.fadeCar(false);
+    this.ui.clearHint('zone');
+  }
+
+  /** Ближайшая дверь: null или { kind: 'vestibule' | 'car' | 'next', label }. */
+  _doorAt(position) {
+    const x = Math.abs(position.x);
+    const z = position.z;
+    if (x > 1.45) return null;
+    if (this.zone === 'car') {
+      if (z < -12.5 && z > -16.2) {
+        return { kind: 'vestibule', label: 'ОТКРЫТЬ ДВЕРЬ В ТАМБУР' };
+      }
+      return null;
+    }
+    if (z > -18.15) return { kind: 'car', label: 'ВЕРНУТЬСЯ В ВАГОН' };
+    if (z < -20.85) return { kind: 'next', label: 'ПЕРЕЙТИ В СОСЕДНИЙ ВАГОН' };
+    return null;
+  }
+
+  _fadeTo(action) {
+    if (this._fading) return;
+    this._fading = true;
+    this._cooldown = 1.3;
+    this.player.setEnabled(false);
+    this.ui.clearHint('zone');
+    this.ui.fadeCar(true);
+    this.audio?.hitch?.();
+    window.setTimeout(() => {
+      action();
+      window.setTimeout(() => {
+        this.ui.fadeCar(false);
+        this._fading = false;
+        if (!this.player.downed) this.player.setEnabled(true);
+      }, 300);
+    }, 320);
+  }
+
+  /** Переход выполняется по нажатию E: подсказка → створки → тамбур/вагон. */
+  _useDoor(kind) {
+    const spawn = kind === 'vestibule'
+      ? ZoneDirector.SPAWN.vestibule
+      : kind === 'next' ? ZoneDirector.SPAWN.nextCar : ZoneDirector.SPAWN.car;
+    const nextZone = kind === 'vestibule' ? 'vestibule' : 'car';
+    const car = kind === 'next' ? (this.getCar() === 0 ? 1 : 0) : this.getCar();
+    this._fadeTo(() => {
+      this.zone = nextZone;
+      this.player.position.set(spawn.x, 0, spawn.z);
+      this.player.velocity.set(0, 0, 0);
+      this.player.feetY = 0;
+      this.player.setYaw?.(spawn.yaw);
+      this.player._syncCamera(0);
+      if (this.onSwitchCar) this.onSwitchCar(car, { teleported: true });
+      if (nextZone === 'vestibule') {
+        if (this.onEnterVestibule) this.onEnterVestibule();
+        this.bus.emit('zone:enteredVestibule', {});
+      } else {
+        if (this.onLeaveVestibule) this.onLeaveVestibule();
+        this.bus.emit('zone:leftVestibule', {});
+      }
+      this.bus.emit('zone:changed', { zone: this.zone });
+      // Дверь «защёлкивается» на мгновение. Игрок, вернувшийся из тамбура,
+      // не должен влететь обратно тем же зажатым E, но и стоять в проёме
+      // с мёртвой дверью нельзя: через секунду подсказка возвращается.
+      this._armed = false;
+      this._armTimer = 0.9;
+      const banner = kind === 'vestibule'
+        ? 'ТАМБУР // БУФЕРНАЯ ЗОНА'
+        : kind === 'next' ? `ВАГОН ${car === 1 ? '07 // СЛУЖЕБНЫЙ' : '06 // ПАССАЖИРСКИЙ'}` : 'САЛОН';
+      this.ui.showToast(banner, 'info', 2400);
+    });
   }
 
   update(dt, enabled = true) {
     this._cooldown = Math.max(0, this._cooldown - dt);
-    if (!enabled) {
-      this._active = false;
-      this.ui.hidePrompt(8);
+    this._armTimer = Math.max(0, this._armTimer - dt);
+    if (!enabled || this._fading) {
+      this.ui.clearHint('zone');
       return;
     }
-    const car = this.getCar();
-    const z = this.player.position.z;
-    const x = this.player.position.x;
-    let near = false;
-    let target = 0;
-    if (car === 0 && z < -13.1 && Math.abs(x) < 1.25) {
-      near = true;
-      target = 1;
-    } else if (car === 1 && z > 13.1 && Math.abs(x) < 1.25) {
-      near = true;
-      target = 0;
+    const door = this._doorAt(this.player.position);
+    const dragging = this.bus && this._isDragging && this._isDragging();
+    if (!this._armed) {
+      // Вернулись в дверной проём: даём подсказке вернуться, но только
+      // когда игрок не тащит тело — иначе двери будут хлопать туда-сюда.
+      const canArm = !dragging && this._armTimer <= 0;
+      if (canArm || !door) this._armed = true;
+      if (!this._armed) {
+        this.ui.clearHint('zone');
+        return;
+      }
     }
-    if (near) {
-      this.camera.getWorldDirection(this._direction);
-      const facing = target === 1
-        ? this._direction.z < -0.45
-        : this._direction.z > 0.45;
-      near = facing;
-    }
-    this._active = near && this._cooldown <= 0;
-    this._target = target;
-    if (!this._active) {
-      this.ui.hidePrompt(8);
+    if (this._cooldown > 0 || !door) {
+      this._autoDragTimer = 0;
+      this.ui.clearHint('zone');
       return;
     }
-    const text = target === 1
-      ? 'ПЕРЕЙТИ В СЛЕДУЮЩИЙ ВАГОН'
-      : 'ВЕРНУТЬСЯ В ПАССАЖИРСКИЙ ВАГОН';
-    this.ui.showPrompt(text, 'E', 'normal', 8);
-  }
-
-  _onInteract(held) {
-    if (!held || !this._active) return;
-    this._cooldown = 1.1;
-    this._active = false;
-    this.ui.hidePrompt(8);
-    if (this.onSwitch) this.onSwitch(this._target);
+    this.ui.setHint('zone', { text: door.label, key: 'E', tone: 'normal', priority: 24 });
+    if (dragging) {
+      // С телом в руках E уже зажата — дверь открывается сама, иначе
+      // переноска через тамбур превращается в пляску с клавишами.
+      this._autoDragTimer += dt;
+      if (this._autoDragTimer > 0.35) {
+        this._autoDragTimer = 0;
+        this._useDoor(door.kind);
+      }
+    } else {
+      this._autoDragTimer = 0;
+    }
   }
 }
 
@@ -9417,7 +10869,7 @@ class BrakeDirector {
       this._visible = false;
       this._progress = 0;
       this.brake.setHighlight(false);
-      this.ui.hidePrompt(18);
+      this.ui.clearHint('brake');
       return;
     }
 
@@ -9432,7 +10884,7 @@ class BrakeDirector {
     if (!this._visible) {
       this._progress = 0;
       this.brake.setHighlight(false);
-      this.ui.hidePrompt(18);
+      this.ui.clearHint('brake');
       return;
     }
 
@@ -9440,16 +10892,16 @@ class BrakeDirector {
     const ratio = clamp(this._progress / CONFIG.mission.brakeHold, 0, 1);
     this.brake.setHighlight(true, ratio);
     const percent = Math.round(ratio * 100);
-    this.ui.showPrompt(
-      ratio > 0 ? `СРЫВАЕТЕ ТОРМОЗ… ${percent}%` : 'УДЕРЖИВАЙТЕ E — СОРВАТЬ ТОРМОЗ',
-      'E',
-      'danger',
-      18,
-    );
+    this.ui.setHint('brake', {
+      text: ratio > 0 ? `СРЫВАЕТЕ ТОРМОЗ… ${percent}%` : 'УДЕРЖИВАЙТЕ E — СОРВАТЬ ТОРМОЗ',
+      key: 'E',
+      tone: 'danger',
+      priority: 24,
+    });
     if (this._progress >= CONFIG.mission.brakeHold) {
       this._progress = 0;
       this._held = false;
-      this.ui.hidePrompt(999);
+      this.ui.clearHint('brake');
       this.demon.requestEscape();
     }
   }
@@ -9607,6 +11059,326 @@ class LobbyDirectory {
 }
 
 // =============================================================================
+// ПРЕДМЕТЫ, МАГАЗИН И ПАДЕНИЕ
+// =============================================================================
+
+/**
+ * Инвентарь проводника: фонарик, бинт, шокер и верёвка.
+ * Всё покупается в автомате; валюта пока бесконечная, поэтому цена —
+ * только антураж, а ограничение — количество предметов в руках.
+ */
+class Inventory {
+  constructor({ camera, scene, audio, bus, ui, player, demon, network, onRevive }) {
+    this.camera = camera;
+    this.scene = scene;
+    this.audio = audio;
+    this.bus = bus;
+    this.ui = ui;
+    this.player = player;
+    this.demon = demon;
+    this.network = network;
+    this.onRevive = onRevive;
+
+    this.counts = { flashlight: 0, bandage: 0, taser: 0, rope: 0 };
+    this.charges = 0;
+    this.recharge = 0;
+    this.flashlightOn = false;
+    this._hudTimer = 0;
+    this._ray = new THREE.Raycaster();
+    this._center = new THREE.Vector2(0, 0);
+
+    this._buildLight();
+    this._onKeyDown = this._onKeyDown.bind(this);
+    window.addEventListener('keydown', this._onKeyDown);
+    this.syncHud();
+  }
+
+  _buildLight() {
+    const light = new THREE.SpotLight(0xfff1cf, 0, 17, Math.PI / 7.5, 0.42, 1.1);
+    light.position.set(0, 0, 0);
+    light.visible = false;
+    this.scene.add(light);
+    this.scene.add(light.target);
+    // Небольшой «блик» у объектива.
+    const beam = new THREE.Mesh(
+      new THREE.CircleGeometry(0.055, 12),
+      new THREE.MeshBasicMaterial({ color: 0xfff4d0, transparent: true, opacity: 0 }),
+    );
+    beam.position.set(0.16, -0.14, -0.42);
+    this.scene.add(beam);
+    this.light = light;
+    this.beam = beam;
+    this._dir = new THREE.Vector3();
+  }
+
+  reset() {
+    this.counts = { flashlight: 0, bandage: 0, taser: 0, rope: 0 };
+    this.charges = 0;
+    this.recharge = 0;
+    this.flashlightOn = false;
+    if (this.light) {
+      this.light.visible = false;
+      this.light.intensity = 0;
+    }
+    if (this.beam) this.beam.material.opacity = 0;
+    this.syncHud();
+  }
+
+  give(kind, amount = 1) {
+    if (!(kind in this.counts)) return;
+    this.counts[kind] += amount;
+    if (kind === 'taser' && this.charges === 0) this.charges = CONFIG.items.taser.charges;
+    this.syncHud();
+  }
+
+  syncHud() {
+    this.ui.setItems({
+      flashlight: this.counts.flashlight,
+      bandage: this.counts.bandage,
+      taser: this.counts.taser,
+      rope: this.counts.rope,
+      charges: this.charges,
+      recharge: this.recharge,
+      taserMax: CONFIG.items.taser.charges,
+      flashlightOn: this.flashlightOn,
+    });
+  }
+
+  _onKeyDown(event) {
+    if (event.repeat) return;
+    const game = this.player;
+    if (!game || !game.enabled) return;
+    if (this.ui.shopOpen) return;
+    if (event.code === 'KeyF') {
+      event.preventDefault();
+      this.toggleFlashlight();
+    } else if (event.code === 'Digit1') {
+      event.preventDefault();
+      this.useBandage();
+    } else if (event.code === 'Digit2') {
+      event.preventDefault();
+      this.useTaser();
+    } else if (event.code === 'Digit3') {
+      event.preventDefault();
+      this.useRope();
+    }
+  }
+
+  update(dt) {
+    if (this.recharge > 0) {
+      this.recharge = Math.max(0, this.recharge - dt);
+      if (this.recharge === 0 && this.counts.taser > 0 && this.charges < CONFIG.items.taser.charges) {
+        this.charges += 1;
+        this.audio.uiClick();
+        if (this.charges < CONFIG.items.taser.charges) this.recharge = CONFIG.items.taser.recharge;
+      }
+      this._hudTimer += dt;
+      if (this._hudTimer > 0.2) {
+        this._hudTimer = 0;
+        this.syncHud();
+      }
+    }
+
+    if (this.light) {
+      const active = this.flashlightOn && this.counts.flashlight > 0 && !this.player.downed;
+      this.light.visible = active;
+      this.light.intensity = active ? 26 : 0;
+      if (this.beam) this.beam.material.opacity = active ? 0.5 : 0;
+      if (active) {
+        this.camera.updateMatrixWorld(true);
+        this.camera.getWorldDirection(this._dir);
+        this.light.position.copy(this.camera.position);
+        this.light.target.position.copy(this.camera.position).addScaledVector(this._dir, 12);
+        this.light.target.updateMatrixWorld();
+        if (this.beam) {
+          this.beam.position.copy(this.camera.position).addScaledVector(this._dir, 0.5);
+          this.beam.lookAt(this.light.target.position);
+        }
+      }
+    }
+  }
+
+  toggleFlashlight() {
+    if (this.counts.flashlight < 1) {
+      this.ui.showToast('ФОНАРИКА НЕТ // КУПИТЕ В АВТОМАТЕ', 'warning', 2400);
+      return;
+    }
+    this.flashlightOn = !this.flashlightOn;
+    this.audio.uiClick();
+    this.syncHud();
+  }
+
+  useBandage() {
+    if (this.counts.bandage < 1) {
+      this.ui.showToast('БИНТОВ НЕТ // АВТОМАТ В ТАМБУРЕ', 'warning', 2400);
+      return;
+    }
+    if (this.player.downed) {
+      this.counts.bandage -= 1;
+      this.syncHud();
+      this.onRevive({ target: 'self' });
+      return;
+    }
+    const target = this._downedNeighbour();
+    if (!target) {
+      this.ui.showToast('РЯДОМ НЕТ УПАВШЕГО', 'warning', 1800);
+      return;
+    }
+    this.counts.bandage -= 1;
+    this.syncHud();
+    this.onRevive({ target: target.id, name: target.name });
+  }
+
+  _downedNeighbour() {
+    if (!this.network) return null;
+    for (const [id, entry] of this.network.remoteStates) {
+      if (!entry || !entry.s || !entry.s.d) continue;
+      const dx = (Number(entry.s.x) || 0) - this.player.position.x;
+      const dz = (Number(entry.s.z) || 0) - this.player.position.z;
+      if (Math.hypot(dx, dz) <= 2.6) {
+        const player = this.network.roster && this.network.roster.get(id);
+        return { id, name: player ? player.name : 'НАПАРНИК' };
+      }
+    }
+    return null;
+  }
+
+  useTaser() {
+    if (this.charges < 1) {
+      this.ui.showToast('ШОКЕР РАЗРЯЖЕН // ПОДОЖДИТЕ', 'warning', 2200);
+      return;
+    }
+    this.camera.updateMatrixWorld(true);
+    this._ray.setFromCamera(this._center, this.camera);
+    this.demon.npc.root.updateMatrixWorld(true);
+    const hits = this._ray.intersectObject(this.demon.npc.root, true);
+    const npc = this.demon.npc.root.position;
+    const distance = Math.hypot(npc.x - this.player.position.x, npc.z - this.player.position.z);
+    if (!hits.length && distance > 2.2) {
+      this.ui.showToast('ШОКЕР: ЦЕЛЬ НЕ В ПРИЦЕЛЕ', 'warning', 1600);
+      return;
+    }
+    if (distance > 5.5) {
+      this.ui.showToast('ШОКЕР: СЛИШКОМ ДАЛЕКО', 'warning', 1600);
+      return;
+    }
+    this.charges -= 1;
+    if (this.recharge <= 0) this.recharge = CONFIG.items.taser.recharge;
+    this.audio.uiError();
+    this.demon.taserHit();
+    this.ui.showToast('РАЗРЯД // ОН ПАДАЕТ', 'success', 2200);
+    this.syncHud();
+  }
+
+  useRope() {
+    if (this.counts.rope < 1) {
+      this.ui.showToast('ВЕРЁВКИ НЕТ // КУПИТЕ В АВТОМАТЕ', 'warning', 2400);
+      return;
+    }
+    const npc = this.demon.npc.root.position;
+    const distance = Math.hypot(npc.x - this.player.position.x, npc.z - this.player.position.z);
+    if (this.demon.phase !== DEMON_PHASE.STUNNED) {
+      this.ui.showToast('НУЖНО СНАЧАЛА УРОНИТЬ ЕГО', 'warning', 2000);
+      return;
+    }
+    if (distance > 3.8) {
+      this.ui.showToast('ПОДОЙДИТЕ К ТЕЛУ', 'warning', 1800);
+      return;
+    }
+    this.counts.rope -= 1;
+    this.syncHud();
+    this.demon.applyRope();
+    this.ui.showToast(`ВЕРЁВКА ЗАТЯНУТА // +${CONFIG.items.rope.bonus} СЕК`, 'success', 2600);
+  }
+}
+
+/** Торговый автомат в тамбуре: светится и продаёт снаряжение. */
+class VendingMachine {
+  constructor({ parent, position = { x: 1.18, z: -18.9 } }) {
+    this.root = new THREE.Group();
+    this.root.position.set(position.x, 0, position.z);
+    this.root.rotation.y = -Math.PI / 2;
+    (parent || this.root).add(this.root);
+    this.hitMeshes = [];
+
+    const body = new THREE.MeshStandardMaterial({ color: 0x2c3a33, roughness: 0.62, metalness: 0.35 });
+    const trim = new THREE.MeshStandardMaterial({ color: 0x141a16, roughness: 0.5, metalness: 0.5 });
+    const glass = new THREE.MeshStandardMaterial({
+      color: 0x25413a,
+      emissive: 0x2f6f57,
+      emissiveIntensity: 0.9,
+      roughness: 0.25,
+      metalness: 0.2,
+    });
+
+    const cabinet = new THREE.Mesh(new THREE.BoxGeometry(0.86, 1.9, 0.42), body);
+    cabinet.position.y = 0.95;
+    this.root.add(cabinet);
+    this.hitMeshes.push(cabinet);
+
+    const windowMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.68, 0.86), glass);
+    windowMesh.position.set(0, 1.32, 0.215);
+    this.root.add(windowMesh);
+
+    // Полки с тусклыми коробками.
+    for (let row = 0; row < 3; row += 1) {
+      for (let col = 0; col < 4; col += 1) {
+        const item = new THREE.Mesh(
+          new THREE.BoxGeometry(0.12, 0.14, 0.04),
+          new THREE.MeshStandardMaterial({
+            color: row === 0 ? 0x8a3a2a : row === 1 ? 0x3a5a8a : 0x7a6a2a,
+            roughness: 0.7,
+            emissive: 0x0a0a08,
+            emissiveIntensity: 0.3,
+          }),
+        );
+        item.position.set(-0.24 + col * 0.16, 1.0 + row * 0.26, 0.2);
+        this.root.add(item);
+      }
+    }
+
+    const panel = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.2, 0.03), trim);
+    panel.position.set(0.24, 0.78, 0.22);
+    this.root.add(panel);
+    const display = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.24, 0.1),
+      new THREE.MeshBasicMaterial({ color: 0x9be3dc }),
+    );
+    display.position.set(0.24, 0.78, 0.238);
+    this.root.add(display);
+
+    const glow = new THREE.PointLight(0x66d6b0, 2.2, 4.4, 2);
+    glow.position.set(0, 1.35, 0.55);
+    this.root.add(glow);
+    this.glow = glow;
+
+    const signCanvas = document.createElement('canvas');
+    signCanvas.width = 256;
+    signCanvas.height = 64;
+    const ctx = signCanvas.getContext('2d');
+    ctx.fillStyle = '#08120e';
+    ctx.fillRect(0, 0, 256, 64);
+    ctx.fillStyle = '#9be3dc';
+    ctx.font = '600 30px "Cascadia Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('АВТОМАТ', 128, 34);
+    const texture = new THREE.CanvasTexture(signCanvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const sign = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.6, 0.15),
+      new THREE.MeshBasicMaterial({ map: texture, transparent: true }),
+    );
+    sign.position.set(0, 2.02, 0.22);
+    this.root.add(sign);
+  }
+
+  update(elapsed) {
+    this.glow.intensity = 2.0 + Math.sin(elapsed * 2.3) * 0.25;
+  }
+}
+
+// =============================================================================
 // ИНТЕРФЕЙС
 // =============================================================================
 
@@ -9627,6 +11399,7 @@ class UIManager {
     this.bus = bus;
     this.audio = audio;
     this.store = store;
+    this._initHints();
     this.network = network;
 
     this._settingsOpen = false;
@@ -9722,6 +11495,33 @@ class UIManager {
       serverEmpty: $('#server-empty'),
       serverCount: $('#server-count'),
       refreshServers: $('#btn-refresh-servers'),
+      hudItems: $('#hud-items'),
+      slots: {
+        flashlight: $('[data-slot="flashlight"]'),
+        bandage: $('[data-slot="bandage"]'),
+        taser: $('[data-slot="taser"]'),
+        rope: $('[data-slot="rope"]'),
+      },
+      slotLabels: {
+        flashlight: $('#slot-flashlight'),
+        bandage: $('#slot-bandage'),
+        taser: $('#slot-taser'),
+        rope: $('#slot-rope'),
+      },
+      shop: $('#modal-shop'),
+      shopGrid: $('#shop-grid'),
+      shopClose: $('#btn-shop-close'),
+      shopDone: $('#btn-shop-done'),
+      wardrobe: $('#modal-wardrobe'),
+      wardrobeButton: $('#btn-wardrobe'),
+      wardrobeClose: $('#btn-wardrobe-close'),
+      wardrobeDone: $('#btn-wardrobe-done'),
+      downed: $('#downed-overlay'),
+      downedHint: $('#downed-hint'),
+      downedTimer: $('#downed-timer'),
+      skinGrid: $('#skin-grid'),
+      skinRandom: $('#btn-skin-random'),
+      skinAccents: $('#skin-accents'),
 
       pauseResume: $('#btn-resume'),
       pauseSettings: $('#btn-pause-settings'),
@@ -9774,6 +11574,7 @@ class UIManager {
     this._buildMeter();
     this._bind();
     this._applySettingsToUI();
+    this.setSkinUI(this.store.values.skin, this.store.values.skinAccent);
     this._resetMicVisuals();
     this._startClock();
 
@@ -9878,6 +11679,59 @@ class UIManager {
         this.bus.emit('ui:refreshServers');
       });
     }
+    if (this.el.shopGrid) {
+      this.el.shopGrid.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-buy]');
+        if (!button) return;
+        this.audio.uiConfirm();
+        this.bus.emit('shop:buy', { kind: button.dataset.buy });
+      });
+    }
+    if (this.el.shopClose) {
+      this.el.shopClose.addEventListener('click', () => this.bus.emit('ui:shopClose', {}));
+    }
+    if (this.el.shopDone) {
+      this.el.shopDone.addEventListener('click', () => this.bus.emit('ui:shopClose', {}));
+    }
+    if (this.el.wardrobeButton) {
+      this.el.wardrobeButton.addEventListener('click', () => this.openWardrobe());
+    }
+    if (this.el.wardrobeClose) {
+      this.el.wardrobeClose.addEventListener('click', () => this.closeWardrobe());
+    }
+    if (this.el.wardrobeDone) {
+      this.el.wardrobeDone.addEventListener('click', () => this.closeWardrobe());
+    }
+    if (this.el.wardrobe) {
+      this.el.wardrobe.addEventListener('click', (event) => {
+        if (event.target === this.el.wardrobe) {
+          this.audio.uiBack();
+          this.closeWardrobe();
+        }
+      });
+    }
+    if (this.el.skinGrid) {
+      this.el.skinGrid.addEventListener('click', (event) => {
+        const card = event.target.closest('button[data-skin]');
+        if (!card) return;
+        this.audio.uiClick();
+        this.bus.emit('settings:skin', { skin: card.dataset.skin });
+      });
+    }
+    if (this.el.skinAccents) {
+      this.el.skinAccents.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-accent]');
+        if (!button) return;
+        this.audio.uiClick();
+        this.bus.emit('settings:skin', { accent: Number(button.dataset.accent) });
+      });
+    }
+    if (this.el.skinRandom) {
+      this.el.skinRandom.addEventListener('click', () => {
+        this.audio.uiConfirm();
+        this.bus.emit('settings:skin', { random: true });
+      });
+    }
     if (this.el.briefingAccept) {
       this.el.briefingAccept.addEventListener('click', () => {
         this.audio.uiConfirm();
@@ -9976,7 +11830,11 @@ class UIManager {
 
     document.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') return;
-      if (this._settingsOpen) {
+      if (this.el.wardrobe && !this.el.wardrobe.hidden) {
+        event.stopPropagation();
+        this.closeWardrobe();
+        this.audio.uiBack();
+      } else if (this._settingsOpen) {
         event.stopPropagation();
         this.closeSettings();
         this.audio.uiBack();
@@ -10802,31 +12660,77 @@ class UIManager {
   // ---------------------------------------------------------------------------
 
   /**
-   * Подсказка с приоритетом: демон (20) важнее билета (12) и двери (8).
-   * Без приоритетов подсказки разных систем перекрывали друг друга.
+   * Подсказки живут по владельцу и приоритету.
+   *
+   * Раньше каждая система показывала и прятала общий элемент в своём порядке,
+   * и демон (приоритет 20) каждый кадр прятал подсказку двери (8): игрок видел,
+   * что подсказки нет, и не понимал, как перейти в тамбур. Теперь системы
+   * заявляют подсказку каждый кадр, а UI сам выбирает старшую и убирает
+   * «протухшие» заявки, которые перестали обновляться.
    */
-  showPrompt(text, key = 'E', tone = 'normal', priority = 10) {
+  _initHints() {
+    this._hints = new Map();
+    this._hintRendered = null;
+  }
+
+  setHint(owner, { text = '', key = 'E', tone = 'normal', priority = 10 } = {}) {
+    if (!this._hints) this._initHints();
+    this._hints.set(owner, {
+      text,
+      key,
+      tone,
+      priority,
+      expires: performance.now() + 160,
+    });
+    this._renderHints();
+  }
+
+  clearHint(owner) {
+    if (!this._hints) return;
+    if (this._hints.delete(owner)) this._renderHints();
+  }
+
+  _renderHints() {
     if (!this.el.prompt) return;
-    if (priority < (this._promptPriority || 0)) return;
-    const signature = `${priority}|${tone}|${key}|${text}`;
-    if (signature === this._promptKey) return;
-    this._promptKey = signature;
-    this._promptPriority = priority;
-    this._promptTone = tone;
-    if (this.el.promptKey) {
-      this.el.promptKey.textContent = key || '';
-      this.el.promptKey.hidden = !key;
+    const now = performance.now();
+    let best = null;
+    for (const [owner, hint] of this._hints) {
+      if (hint.expires < now) {
+        this._hints.delete(owner);
+        continue;
+      }
+      if (!hint.text) continue;
+      if (!best || hint.priority > best.priority) best = hint;
     }
-    if (this.el.promptText) this.el.promptText.textContent = text;
-    this.el.prompt.dataset.tone = tone;
+    if (!best) {
+      if (this._hintRendered !== null) {
+        this._hintRendered = null;
+        this.el.prompt.hidden = true;
+      }
+      return;
+    }
+    const signature = `${best.priority}|${best.tone}|${best.key}|${best.text}`;
+    if (signature === this._hintRendered) return;
+    this._hintRendered = signature;
+    if (this.el.promptKey) {
+      this.el.promptKey.textContent = best.key || '';
+      this.el.promptKey.hidden = !best.key;
+    }
+    if (this.el.promptText) this.el.promptText.textContent = best.text;
+    this.el.prompt.dataset.tone = best.tone;
     this.el.prompt.hidden = false;
   }
 
+  /** Совместимость: старые вызовы без владельца. */
+  showPrompt(text, key = 'E', tone = 'normal', priority = 10) {
+    this.setHint('legacy', { text, key, tone, priority });
+  }
+
   hidePrompt(priority = 10) {
-    if (priority < (this._promptPriority || 0)) return;
-    this._promptPriority = 0;
-    this._promptKey = '';
-    if (this.el.prompt) this.el.prompt.hidden = true;
+    const hint = this._hints && this._hints.get('legacy');
+    if (!hint) return;
+    if (priority < hint.priority) return;
+    this.clearHint('legacy');
   }
 
   /** Задача смены в верхней части HUD. */
@@ -10902,7 +12806,9 @@ class UIManager {
       const title = document.createElement('b');
       title.textContent = server.host || 'БЕЗЫМЯННЫЙ ПРОВОДНИК';
       const sub = document.createElement('small');
-      const partName = server.part >= 4 ? 'ЧАСТЬ IV' : server.part === 3 ? 'ЧАСТЬ III' : 'РЕЙС 06';
+      const partName = server.part >= 5 ? 'ЧАСТЬ V'
+        : server.part === 4 ? 'ЧАСТЬ IV'
+          : server.part === 3 ? 'ЧАСТЬ III' : 'РЕЙС 06';
       sub.textContent = `КОД ${server.code} // ${partName}`;
       main.append(title, sub);
       const crew = document.createElement('span');
@@ -10917,6 +12823,92 @@ class UIManager {
     }
     this.el.serverList.innerHTML = '';
     this.el.serverList.appendChild(fragment);
+  }
+
+  /** Панель предметов: количество и заряды. */
+  setItems({ flashlight = 0, bandage = 0, taser = 0, rope = 0, charges = 0, recharge = 0, taserMax = 3, flashlightOn = false } = {}) {
+    const set = (key, label, empty, active = false) => {
+      const slot = this.el.slots && this.el.slots[key];
+      const text = this.el.slotLabels && this.el.slotLabels[key];
+      if (!slot) return;
+      slot.dataset.empty = empty ? 'true' : 'false';
+      slot.dataset.active = active ? 'true' : 'false';
+      if (text) text.textContent = label;
+    };
+    set('flashlight', flashlight ? (flashlightOn ? 'ВКЛ' : 'ВЫКЛ') : 'НЕТ', !flashlight, flashlightOn);
+    set('bandage', String(bandage), bandage < 1);
+    const chargeText = taser ? `${charges}/${taserMax}${recharge > 0 ? ` · ${Math.ceil(recharge)}с` : ''}` : '0';
+    set('taser', chargeText, !taser);
+    set('rope', String(rope), rope < 1);
+  }
+
+  openWardrobe() {
+    if (!this.el.wardrobe) return;
+    if (this.el.menu) this.el.menu.hidden = true;
+    this.el.wardrobe.hidden = false;
+    this.setSkinUI(this.store.values.skin, this.store.values.skinAccent);
+    this.bus.emit('ui:wardrobeOpen', {
+      skin: this.store.values.skin,
+      accent: this.store.values.skinAccent,
+    });
+    window.setTimeout(() => this.el.wardrobeDone && this.el.wardrobeDone.focus({ preventScroll: true }), 0);
+  }
+
+  closeWardrobe() {
+    if (!this.el.wardrobe || this.el.wardrobe.hidden) return;
+    this.el.wardrobe.hidden = true;
+    if (this.el.menu) this.el.menu.hidden = false;
+    this.bus.emit('ui:wardrobeClose', {});
+    if (this.el.wardrobeButton) {
+      window.setTimeout(() => this.el.wardrobeButton.focus({ preventScroll: true }), 0);
+    }
+  }
+
+  get wardrobeOpen() {
+    return Boolean(this.el.wardrobe && !this.el.wardrobe.hidden);
+  }
+
+  openShop() {
+    if (this.el.shop) this.el.shop.hidden = false;
+  }
+
+  closeShop() {
+    if (this.el.shop && !this.el.shop.hidden) {
+      this.el.shop.hidden = true;
+      this.audio.uiBack();
+    }
+  }
+
+  get shopOpen() {
+    return Boolean(this.el.shop && !this.el.shop.hidden);
+  }
+
+  showDowned(hint) {
+    if (this.el.downed) this.el.downed.hidden = false;
+    if (hint && this.el.downedHint) this.el.downedHint.textContent = hint;
+  }
+
+  hideDowned() {
+    if (this.el.downed) this.el.downed.hidden = true;
+    if (this.el.downedTimer) this.el.downedTimer.textContent = '';
+  }
+
+  setDownedTimer(seconds) {
+    if (!this.el.downedTimer) return;
+    this.el.downedTimer.textContent = seconds > 0 ? `ДО ПОТЕРИ СОЗНАНИЯ ${Math.ceil(seconds)} С` : '';
+  }
+
+  setSkinUI(skin, accent = 0) {
+    if (this.el.skinGrid) {
+      for (const card of this.el.skinGrid.querySelectorAll('[data-skin]')) {
+        card.setAttribute('aria-pressed', String(card.dataset.skin === skin));
+      }
+    }
+    if (this.el.skinAccents) {
+      for (const button of this.el.skinAccents.querySelectorAll('[data-accent]')) {
+        button.setAttribute('aria-pressed', String(Number(button.dataset.accent) === accent));
+      }
+    }
   }
 
   /** Состояние микрофона: слушает ли вагон игрока и доступна ли речь. */
@@ -11185,6 +13177,18 @@ class Game {
       passengers: this.passengers,
       onCheck: (passenger) => this._onTicketChecked(passenger),
     });
+    this.vendingMachine = new VendingMachine({ parent: this.world.group });
+    this.inventory = new Inventory({
+      camera: this.camera,
+      scene: this.scene,
+      audio: this.audio,
+      bus: this.bus,
+      ui: this.ui,
+      player: this.player,
+      demon: this.demon,
+      network: this.network,
+      onRevive: (payload) => this._revive(payload),
+    });
     this.brakeValve = new BrakeValve({ parent: this.world.group });
     this.brakeValve.root.visible = false;
     this.brakeDirector = new BrakeDirector({
@@ -11196,14 +13200,17 @@ class Game {
       brake: this.brakeValve,
       getCar: () => this.demon.localCar,
     });
-    this.doorDirector = new DoorDirector({
-      camera: this.camera,
+    this.zoneDirector = new ZoneDirector({
       player: this.player,
       ui: this.ui,
       bus: this.bus,
+      audio: this.audio,
       getCar: () => this.demon.localCar,
-      onSwitch: (car) => this._switchCar(car),
+      onSwitchCar: (car, options) => this._switchCar(car, options),
+      onEnterVestibule: () => { this._inVestibule = true; },
+      onLeaveVestibule: () => { this._inVestibule = false; },
     });
+    this.zoneDirector._isDragging = () => Boolean(this.demon && this.demon._draggingId);
     this.mission = new MissionDirector({
       bus: this.bus,
       ui: this.ui,
@@ -11221,6 +13228,10 @@ class Game {
     this.network.setLocalStateProvider(() => {
       const state = this.player.getNetworkState();
       state.c = this._localInCar ? 1 : 0;
+      state.zone = this.zoneDirector ? this.zoneDirector.zone : 'car';
+      state.d = this.player.downed ? 1 : 0;
+      state.skin = this.store.values.skin;
+      state.accent = this.store.values.skinAccent;
       return state;
     });
     this.network.setNameProvider(() => this.store.values.callsign || '');
@@ -11270,10 +13281,75 @@ class Game {
     this.bus.on('settings:sensitivity', (value) => this.player.setSensitivity(value));
 
     // Часть IV: инструктаж, двери, тормоз и каталог вагонов.
+    this.bus.on('player:interact', ({ held } = {}) => {
+      if (!held || this.state !== STATE.PLAYING) return;
+      if (this.player.downed) return;
+      // Дверь: явное нажатие E у створок.
+      if (!this.ui.shopOpen && this.zoneDirector && this.zoneDirector._cooldown <= 0) {
+        const door = this.zoneDirector._armed ? this.zoneDirector._doorAt(this.player.position) : null;
+        if (door) {
+          this.zoneDirector._useDoor(door.kind);
+          return;
+        }
+      }
+      if (this.zoneDirector.zone === 'vestibule' && !this.ui.shopOpen) {
+        // С телом в руках автомат не открываем: иначе E ведёт себя двояко.
+        if (this.demon._draggingId || this.demon._dragHelpers.size) return;
+        // Только со стороны автомата: у борта E сбрасывает тело, а не открывает магазин.
+        if (this.player.position.x < 0.15) return;
+        const dx = this.player.position.x - this.vendingMachine.root.position.x;
+        const dz = this.player.position.z - this.vendingMachine.root.position.z;
+        if (Math.hypot(dx, dz) <= 1.95 && !this.player.downed) this._openShop();
+      }
+    });
+    this.bus.on('player:downed', () => this._onLocalDowned());
+    this.bus.on('player:revived', () => this._onLocalRevived());
+    this.bus.on('demon:thrown', () => this._onDemonThrown());
+    this.bus.on('shop:buy', ({ kind } = {}) => {
+      if (!kind || !CONFIG.items[kind]) return;
+      this.inventory.give(kind);
+      this.audio.uiConfirm();
+      this.ui.showToast(`КУПЛЕНО: ${CONFIG.items[kind].name}`, 'success', 2000);
+    });
+    this.bus.on('settings:skin', ({ skin, accent, random } = {}) => {
+      const patch = {};
+      if (random) {
+        const pool = CONFIG.skins.filter((entry) => entry !== this.store.values.skin);
+        patch.skin = pool[Math.floor(Math.random() * pool.length)] || 'conductor';
+        patch.skinAccent = Math.floor(Math.random() * 4);
+      }
+      if (skin && CONFIG.skins.includes(skin)) patch.skin = skin;
+      if (Number.isInteger(accent)) patch.skinAccent = clamp(accent, 0, 3);
+      if (!Object.keys(patch).length) return;
+      this.store.save(patch);
+      this.ui.setSkinUI(this.store.values.skin, this.store.values.skinAccent);
+      if (this.ui.wardrobeOpen) {
+        this.remotePlayers.showSkinPreview(this.store.values.skin, this.store.values.skinAccent);
+      }
+      this.ui.showToast('ВНЕШНОСТЬ ОБНОВЛЕНА', 'info', 1600);
+    });
+    this.bus.on('voice:howl', ({ hz } = {}) => {
+      this.ui.showToast(
+        `ПОДАВЛЕН ПИСК В КАНАЛЕ${hz ? ` // ${Math.round(hz)} ГЦ` : ''}`,
+        'warning',
+        3200,
+      );
+    });
+    this.bus.on('zone:changed', ({ zone } = {}) => {
+      this.demon.setLocalZone(zone);
+      this.world.setZone(zone);
+      this.ui.hidePrompt(12);
+    });
     this.bus.on('ui:acceptBriefing', () => {
       this.mission.acceptBriefing();
       this.audio.uiConfirm();
     });
+    this.bus.on('ui:shopClose', () => this._closeShop());
+    this.bus.on('ui:wardrobeOpen', ({ skin, accent } = {}) => {
+      if (this.state !== STATE.MENU) return;
+      this.remotePlayers.showSkinPreview(skin, accent);
+    });
+    this.bus.on('ui:wardrobeClose', () => this.remotePlayers.hideSkinPreview());
     this.bus.on('ui:joinServer', (code) => this._joinByCode(code));
     this.bus.on('ui:refreshServers', () => this._refreshServers());
     this.bus.on('ui:joinOpened', () => {
@@ -11326,6 +13402,12 @@ class Game {
     this.bus.on('player:unlock', () => this._onPointerUnlock());
 
     document.addEventListener('pointerlockerror', () => this._onPointerLockError());
+    window.addEventListener('keydown', (event) => {
+      if (event.code === 'Escape' && this.ui.shopOpen) {
+        event.preventDefault();
+        this._closeShop();
+      }
+    });
     this.renderer.domElement.addEventListener('contextmenu', (event) => event.preventDefault());
     window.addEventListener('resize', () => this._resize());
 
@@ -11370,6 +13452,8 @@ class Game {
   // ---------------------------------------------------------------------------
 
   _setupMenuView() {
+    // Сохранённая внешность должна быть подсвечена в настройках сразу.
+    this.ui.setSkinUI(this.store.values.skin, this.store.values.skinAccent);
     this.camera.fov = CONFIG.camera.fov;
     this.camera.updateProjectionMatrix();
     this.camera.rotation.set(-0.025, 0, 0, 'YXZ');
@@ -11445,6 +13529,10 @@ class Game {
     this.audio.init();
     this.voice.init();
     this._menuEnteredAt = performance.now();
+    if (this.ui.wardrobeOpen) {
+      this.ui.closeWardrobe();
+      this.remotePlayers.hideSkinPreview();
+    }
 
     this.state = STATE.LOBBY;
     this.ui.showLobby({ code: '', mode: 'host' });
@@ -11491,6 +13579,10 @@ class Game {
 
   joinSession(result) {
     if (!result || !result.ok || !result.session) return;
+    if (this.ui.wardrobeOpen) {
+      this.ui.closeWardrobe();
+      this.remotePlayers.hideSkinPreview();
+    }
     this.session = result.session;
     this.state = STATE.LOBBY;
     this._menuEnteredAt = performance.now();
@@ -11522,9 +13614,186 @@ class Game {
       passenger.setHighlight(false);
     }
     this.world.setCarVariant(0);
+    this.world.setZone('car');
     this.brakeValve.root.visible = false;
     this.demon.setLocalCar(0);
+    this.demon.setLocalZone('car');
+    this.zoneDirector.reset();
+    this.inventory.reset();
+    this.ui.hideDowned();
+    this.ui.closeShop();
+    this.player.setDowned(false);
+    this._dumpProgress = 0;
+    this._downedTimer = 0;
+    this._demonThrown = false;
     this.directory.clearLocal();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Магазин и предметы
+  // ---------------------------------------------------------------------------
+
+  _openShop() {
+    if (this.ui.shopOpen) return;
+    // Магазин не ставит игру на паузу: пассажир в соседнем вагоне живой.
+    this.ui.openShop();
+    this.inventory.syncHud();
+    this.player.setEnabled(false);
+    this.ui.hidePrompt(999);
+    this.player.unlock();
+    this.audio.uiClick();
+  }
+
+  _closeShop() {
+    if (!this.ui.shopOpen) return;
+    this.ui.closeShop();
+    this._requestPointerLock(false);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Падение, подъём и сброс демона
+  // ---------------------------------------------------------------------------
+
+  _onLocalDowned() {
+    if (this.player.downed) return;
+    this.player.setDowned(true);
+    this._downedTimer = CONFIG.mission.bleedout;
+    this.audio.uiError();
+    const hint = this.inventory.counts.bandage > 0
+      ? 'У ВАС ЕСТЬ БИНТ — НАЖМИТЕ 1, ЧТОБЫ ПОДНЯТЬСЯ'
+      : 'ДРУГОЙ ПРОВОДНИК МОЖЕТ ПОДНЯТЬ ВАС БИНТОМ // ИЛИ ДОБЕРИТЕСЬ ДО АВТОМАТА';
+    this.ui.showDowned(hint);
+    this.ui.setDownedTimer(this._downedTimer);
+    this.ui.showToast('ВЫ ПАЛИ // ОН ИДЁТ ДАЛЬШЕ', 'error', 4200);
+  }
+
+  _onLocalRevived() {
+    if (!this.player.downed) return;
+    this.player.setDowned(false);
+    if (this.state === STATE.PLAYING) this.player.setEnabled(true);
+    this._downedTimer = 0;
+    this.ui.hideDowned();
+    this.audio.uiConfirm();
+    this.ui.showToast('БИНТ ЗАТЯНУТ // ВЫ СНОВА НА НОГАХ', 'success', 2600);
+  }
+
+  _updateDowned(dt) {
+    if (!this.player.downed) {
+      if (this._downedTimer) {
+        this._downedTimer = 0;
+        this.ui.setDownedTimer(0);
+      }
+      return;
+    }
+    this._downedTimer = Math.max(0, this._downedTimer - dt);
+    if (Math.floor(this._downedTimer) !== Math.floor(this._downedTimer + dt)) {
+      this.ui.setDownedTimer(this._downedTimer);
+    }
+    if (this._downedTimer <= 0) {
+      this._downedTimer = 0;
+      this.ui.hideDowned();
+      this.demon.onGameOver({ target: this.network.selfId, name: this.network._displayName() });
+    }
+  }
+
+  _revive({ target } = {}) {
+    if (!target) return;
+    if (target === 'self') {
+      this.demon.reviveTarget(this.network.selfId || 'local');
+      if (this.player.downed) this._onLocalRevived();
+      return;
+    }
+    this.demon.reviveTarget(target);
+    this.ui.showToast('НАПАРНИК ПОДНЯТ', 'success', 2200);
+  }
+
+  /** Автомат в тамбуре: подсказка и открытие магазина. */
+  _updateVending(enabled) {
+    if (!enabled || this.zoneDirector.zone !== 'vestibule') {
+      this.ui.hidePrompt(13);
+      return;
+    }
+    if (this.player.position.x < 0.15) {
+      this.ui.hidePrompt(13);
+      return;
+    }
+    const dx = this.player.position.x - this.vendingMachine.root.position.x;
+    const dz = this.player.position.z - this.vendingMachine.root.position.z;
+    const distance = Math.hypot(dx, dz);
+    if (distance > 1.95) {
+      this.ui.hidePrompt(13);
+      return;
+    }
+    if (this.ui.shopOpen) return;
+    const dragging = this.demon._draggingId || this.demon._dragHelpers.size;
+    if (dragging) {
+      this.ui.showPrompt('АВТОМАТ ЗАНЯТ // ОТПУСТИТЕ ТЕЛО', '', 'normal', 13);
+      return;
+    }
+    this.ui.showPrompt('ТОРГОВЫЙ АВТОМАТ', 'E', 'normal', 13);
+  }
+
+  /** Удержание E у борта: сброс демона с поезда. */
+  _updateDump(enabled) {
+    if (!enabled || this.ui.shopOpen || this.zoneDirector.zone !== 'vestibule') {
+      this._dumpProgress = 0;
+      return;
+    }
+    if (this.demon.phase !== DEMON_PHASE.STUNNED || this._demonThrown) {
+      this._dumpProgress = 0;
+      return;
+    }
+    const npc = this.demon.npc.root.position;
+    const distance = Math.hypot(npc.x - this.player.position.x, npc.z - this.player.position.z);
+    // Полоса сброса держится в стороне от южной двери (−20.85), иначе
+    // с телом в руках игрок уезжает в соседний вагон вместо сброса.
+    const nearEdge = this.player.position.x < -0.5
+      && this.player.position.z < -18.3 && this.player.position.z > -21.1;
+    if (distance > CONFIG.mission.dumpDistance || !nearEdge) {
+      this._dumpProgress = 0;
+      return;
+    }
+    if (this.player.interactHeld) this._dumpProgress += this.tickDt || 0.016;
+    else this._dumpProgress = Math.max(0, this._dumpProgress - 0.02);
+    const ratio = clamp(this._dumpProgress / CONFIG.mission.dumpHold, 0, 1);
+    this.ui.showPrompt(
+      ratio > 0 ? `СБРАСЫВАЕМ ЕГО ЗА БОРТ… ${Math.round(ratio * 100)}%` : 'УДЕРЖИВАЙТЕ E — СБРОСИТЬ ЕГО С ПОЕЗДА',
+      'E',
+      'danger',
+      21,
+    );
+    if (this._dumpProgress >= CONFIG.mission.dumpHold) {
+      this._dumpProgress = 0;
+      this._demonThrown = true;
+      this.ui.hidePrompt(999);
+      this.demon.throwOut();
+    }
+  }
+
+  _onDemonThrown() {
+    if (!this.demon.active) return;
+    // Смена окончена: отпускаем управление, чтобы можно было нажать «В меню».
+    if (this.state === STATE.PLAYING) {
+      this.state = STATE.PAUSED;
+      this.player.setEnabled(false);
+      this.player.unlock();
+      this.voiceWatcher.pause();
+      this.audio.setScene('menu');
+    }
+    this.audio.uiConfirm();
+    this.ui.setObjective({
+      text: 'ОН ЗА БОРТОМ // СМЕНА ОКОНЧЕНА',
+      progress: 'ПОЕЗД ИДЁТ ДАЛЬШЕ',
+      danger: false,
+    });
+    this.ui.showEnded({
+      title: 'СМЕНА ОКОНЧЕНА',
+      text: 'Тело ушло в темноту между вагонами. Дверь тамбура закрылась, '
+        + 'и поезд поехал дальше без пятого пассажира. Вы выжили.',
+      kicker: 'ВАГОН 06 // СИГНАЛ ВОССТАНОВЛЕН',
+      dead: false,
+    });
+    this.ui.showToast('ВЫ СБРОСИЛИ ЕГО С ПОЕЗДА', 'success', 6000);
   }
 
   _onTicketChecked(passenger) {
@@ -11540,36 +13809,25 @@ class Game {
     this.ui.showToast(`БИЛЕТ ПРОВЕРЕН // ${checked} ИЗ ${total}`, 'info', 2200);
   }
 
-  /** Дверь в конце салона: затемнение и перенос в другой вагон. */
-  _switchCar(car) {
+  /** Смена вагона: геометрия, пассажиры, краны. Переход делает ZoneDirector. */
+  _switchCar(car, { teleported = false } = {}) {
     const next = car === 1 ? 1 : 0;
-    if (next === this.demon.localCar || this._switchingCar) return;
-    this._switchingCar = true;
-    this.player.setEnabled(false);
-    this.ui.hidePrompt(999);
-    this.ui.fadeCar(true);
-    this.audio.hitch();
-    this._carTimer = window.setTimeout(() => {
-      this.demon.setLocalCar(next);
-      this.world.setCarVariant(next);
-      for (const passenger of this.passengers) {
-        passenger.root.visible = next === 0;
-        passenger.setHighlight(false);
-      }
-      this.brakeValve.root.visible = next === 1;
-      // Входим через тамбур: следующий вагон начинается с дальнего конца.
-      const z = next === 1 ? 13.55 : -13.55;
-      this.player.position.set(0.08, 0, z);
-      this.player.velocity.set(0, 0, 0);
-      this.player._syncCamera(0);
+    const changed = next !== this.demon.localCar;
+    this.demon.setLocalCar(next);
+    this.world.setCarVariant(next);
+    if (this.zoneDirector) this.world.setZone(this.zoneDirector.zone);
+    for (const passenger of this.passengers) {
+      passenger.root.visible = next === 0 && this.zoneDirector.zone === 'car';
+      passenger.setHighlight(false);
+    }
+    this.brakeValve.root.visible = next === 1 && this.zoneDirector && this.zoneDirector.zone === 'car';
+    if (changed) {
       this.mission.onCarChanged(next);
       this.bus.emit('demon:changedCar', { car: next });
-      this._carTimer = window.setTimeout(() => {
-        this.ui.fadeCar(false);
-        this._switchingCar = false;
-        if (this.state === STATE.PLAYING) this.player.setEnabled(true);
-      }, 320);
-    }, 380);
+    }
+    // Тело в руках переезжает вместе с проводником — иначе оно остаётся
+    // в закрытом вагоне, и переноска через тамбур ломается.
+    if (teleported && this.demon && this.demon.followLocalPlayer) this.demon.followLocalPlayer();
   }
 
   _joinByCode(raw) {
@@ -11636,6 +13894,8 @@ class Game {
     this.demon.activate();
     this.demon.setLocalCar(0);
     this.world.setCarVariant(0);
+    this.world.setZone('car');
+    this.zoneDirector.reset();
     this.brakeValve.root.visible = false;
     for (const passenger of this.passengers) passenger.root.visible = true;
     this.mission.begin();
@@ -11831,6 +14091,13 @@ class Game {
 
   _onPointerLock() {
     this._clearLockFallback();
+    if (this.state === STATE.PLAYING) {
+      // Возврат из магазина: управление и микрофон снова в строю.
+      this.player.setEnabled(true);
+      if (!this.voiceWatcher.active) this.voiceWatcher.start();
+      else this.voiceWatcher.resume();
+      return;
+    }
     if (this.state !== STATE.DEPLOYING && this.state !== STATE.PAUSED) return;
     this.state = STATE.PLAYING;
     this.player.setEnabled(true);
@@ -11849,6 +14116,8 @@ class Game {
 
   _onPointerUnlock() {
     if (this.state !== STATE.PLAYING) return;
+    // Магазин открыт намеренно: курсор нужен для кнопок, пауза не нужна.
+    if (this.ui.shopOpen) return;
     this._enterPause();
   }
 
@@ -11875,7 +14144,10 @@ class Game {
         'warning',
         5200,
       );
+      return;
     }
+    // Магазин закрылся, а курсор не захватился — уходим в обычную паузу.
+    if (this.state === STATE.PLAYING) this._enterPause();
   }
 
   resumeSession() {
@@ -11936,6 +14208,7 @@ class Game {
     const dt = this.state === STATE.PLAYING
       ? Math.min(rawDelta, 0.5)
       : Math.min(rawDelta, 0.05);
+    this.tickDt = dt;
     this.elapsed += dt;
 
     if (this.state === STATE.PLAYING) {
@@ -11943,17 +14216,30 @@ class Game {
       // Пассажир думает после игрока: цель уже сдвинулась в этом кадре.
       this.demon.update(dt, this.elapsed);
       this.voiceWatcher.update(dt);
-      const uiEnabled = !this.mission.briefingOpen && !this._switchingCar;
+      const uiEnabled = !this.mission.briefingOpen && !this._switchingCar && !this.player.downed;
       this.ticketInspector.update(dt, this.elapsed, {
         enabled: uiEnabled && this.demon.localCar === 0,
       });
-      this.doorDirector.update(dt, uiEnabled);
+      this.zoneDirector.update(dt, uiEnabled);
       this.brakeDirector.update(dt, this.elapsed, uiEnabled);
+      this.inventory.update(dt);
+      this.vendingMachine.update(this.elapsed);
+      this._updateVending(uiEnabled);
+      this._updateDump(uiEnabled);
+      this._updateDowned(dt);
       this.mission.update(dt);
     } else if (this.state === STATE.MENU || this.state === STATE.LOBBY) {
       this._updateMenuCamera(this.elapsed);
       // В меню пассажир просто сидит — анимация нужна и здесь.
       this.demon.npc.update(dt, this.elapsed);
+    }
+    if (this.remotePlayers.previewActive) this.remotePlayers.updatePreview(this.elapsed);
+
+    // Дверь в тамбур разъезжается, когда игрок подходит с любой стороны.
+    if (this.world && this.world.setDoorOpen) {
+      const z = this.player.position.z;
+      const zone = this.zoneDirector ? this.zoneDirector.zone : 'car';
+      this.world.setDoorOpen(zone === 'vestibule' ? z > -18.2 : z < -11.4);
     }
 
     // Плавно подводим «атмосферную» усталость к цели.
