@@ -26,7 +26,7 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 // =============================================================================
 
 const CONFIG = {
-  version: '0.2.0',
+  version: '0.2.1',
   part: 2,
   car: {
     width: 3.8,          // внутренняя ширина
@@ -74,9 +74,48 @@ const CONFIG = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
       { urls: 'stun:global.stun.twilio.com:3478' },
       // Для игроков за symmetric NAT добавьте сюда TURN (см. README).
     ],
+    // ---------------------------------------------------------------------
+    // Вариант А: сигнализация через публичные relay-сети (Trystero).
+    // 0.peerjs.com у части провайдеров недоступен, а эти узлы живут на 443
+    // и потому проходят там, где «сигнальный сервер» PeerJS молчит.
+    // Всё остальное (позиции, голос) по-прежнему идёт напрямую по WebRTC.
+    // ---------------------------------------------------------------------
+    relay: {
+      appId: 'nv06-polunochny-express',
+      password: 'nv06-platform-9',
+      // Сколько ждать открытия сокета при проверке канала.
+      probeTimeout: 3000,
+      // Как часто повторять «я здесь» до установки прямого соединения.
+      announceInterval: 1200,
+      // Таймаут ожидания хоста в режиме relay (голос/рукопожатие дольше).
+      joinTimeout: 18000,
+      redundancy: 2,
+      order: ['mqtt', 'torrent', 'nostr'],
+      transports: {
+        mqtt: [
+          'wss://broker.emqx.io:8084/mqtt',
+          'wss://broker.hivemq.com:8884/mqtt',
+          'wss://test.mosquitto.org:8081/mqtt',
+          'wss://mqtt.eclipseprojects.io/mqtt',
+          'wss://public:public@public.cloud.shiftr.io',
+        ],
+        torrent: [
+          'wss://tracker.openwebtorrent.com',
+          'wss://tracker.webtorrent.dev',
+          'wss://tracker.files.fm:7073/announce',
+          'wss://tracker.btorrent.xyz',
+        ],
+        nostr: [
+          'wss://relay.damus.io',
+          'wss://nos.lol',
+          'wss://relay.nostr.band',
+        ],
+      },
+    },
   },
   voice: {
     refDistance: 2.2,
@@ -178,7 +217,13 @@ const DEFAULT_SETTINGS = Object.freeze({
   voiceEnabled: true,
   voiceMode: 'open', // 'open' | 'ptt'
   callsign: '',
+  // Канал сигнализации: 'auto' перебирает relay-сети и в крайнем случае
+  // откатывается на PeerJS Cloud. 'peerjs' — принудительно старый путь.
+  netTransport: 'auto', // 'auto' | 'mqtt' | 'torrent' | 'nostr' | 'peerjs'
+  relayCustom: '',
 });
+
+const NET_TRANSPORTS = ['auto', 'mqtt', 'torrent', 'nostr', 'peerjs'];
 
 class SettingsStore {
   constructor(key = 'midnight-express:settings:v1') {
@@ -209,6 +254,12 @@ class SettingsStore {
       }
       if (typeof parsed.callsign === 'string') {
         this.values.callsign = parsed.callsign.slice(0, 18);
+      }
+      if (NET_TRANSPORTS.includes(parsed.netTransport)) {
+        this.values.netTransport = parsed.netTransport;
+      }
+      if (typeof parsed.relayCustom === 'string') {
+        this.values.relayCustom = parsed.relayCustom.slice(0, 160);
       }
     } catch (error) {
       console.warn('[Settings] Не удалось прочитать localStorage', error);
@@ -3483,6 +3534,162 @@ class PlayerController {
 }
 
 // =============================================================================
+// СЕТЬ — RELAY-СИГНАЛИЗАЦИЯ (Trystero: MQTT / WebTorrent / Nostr)
+// -----------------------------------------------------------------------------
+// Публичный PeerJS Cloud (0.peerjs.com) у части провайдеров недоступен.
+// Эти стратегии ищут друг друга через открытые relay-узлы на 443 (MQTT/WSS,
+// WebTorrent-трекеры, Nostr-реле), а сам игровой трафик и голос по-прежнему
+// идут напрямую между браузерами по WebRTC.
+// =============================================================================
+
+const RELAY_MODULE = { loaded: null, loading: null };
+
+function loadRelayModule() {
+  if (RELAY_MODULE.loaded) return Promise.resolve(RELAY_MODULE.loaded);
+  if (!RELAY_MODULE.loading) {
+    RELAY_MODULE.loading = import('./vendor/trystero-relays.js')
+      .then((mod) => {
+        if (typeof mod.joinMqtt !== 'function' || typeof mod.selfId !== 'string') {
+          throw new Error('RELAY_BUNDLE_INVALID');
+        }
+        RELAY_MODULE.loaded = mod;
+        return mod;
+      })
+      .catch((error) => {
+        RELAY_MODULE.loading = null;
+        throw error;
+      });
+  }
+  return RELAY_MODULE.loading;
+}
+
+/**
+ * Проверяет, открывается ли WebSocket до relay-узла. Это единственный
+ * надёжный способ узнать, что канал не режет провайдер: сам joinRoom
+ * возвращается сразу и молча ждёт узлы в фоне.
+ */
+function probeSocket(url, options = {}) {
+  const timeout = options.timeout || CONFIG.network.relay.probeTimeout;
+  const useMqttProtocol = options.mqtt !== false && /\/mqtt(\?|$)/i.test(url);
+  return new Promise((resolve) => {
+    const started = performance.now();
+    let socket = null;
+    let settled = false;
+    const finish = (ok, detail) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      if (socket) {
+        try {
+          socket.close();
+        } catch (error) {
+          /* ignore */
+        }
+      }
+      resolve({ url, ok, ms: Math.round(performance.now() - started), detail });
+    };
+    const timer = window.setTimeout(() => finish(false, 'timeout'), timeout);
+    try {
+      // Для MQTT-брокеров нужен подпротокол mqtt, иначе часть узлов
+      // закрывает соединение ещё на рукопожатии.
+      socket = useMqttProtocol ? new WebSocket(url, ['mqtt']) : new WebSocket(url);
+      socket.onopen = () => finish(true, 'open');
+      socket.onerror = () => finish(false, 'error');
+      socket.onclose = (event) => finish(false, event.code ? `close ${event.code}` : 'close');
+    } catch (error) {
+      finish(false, 'blocked');
+    }
+  });
+}
+
+/** Отдельная проверка PeerJS Cloud: XHR к /peerjs/id, как у самого клиента. */
+function probePeerJs(timeout = 3500) {
+  return new Promise((resolve) => {
+    const started = performance.now();
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeout);
+    fetch(`https://0.peerjs.com/peerjs/id?ts=${Date.now()}`, {
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+      .then((response) => {
+        window.clearTimeout(timer);
+        resolve({
+          ok: Boolean(response.ok),
+          ms: Math.round(performance.now() - started),
+          detail: response.ok ? 'open' : `http ${response.status}`,
+        });
+      })
+      .catch((error) => {
+        window.clearTimeout(timer);
+        resolve({
+          ok: false,
+          ms: Math.round(performance.now() - started),
+          detail: error && error.name === 'AbortError' ? 'timeout' : 'blocked',
+        });
+      });
+  });
+}
+
+/**
+ * Мини-адаптер PeerJS DataConnection поверх Trystero. Благодаря ему весь
+ * протокол лобби (welcome/roster/state/ping) остаётся прежним и не зависит
+ * от транспорта.
+ */
+class RelaySocket {
+  constructor({ peer, metadata, send }) {
+    this.peer = peer;
+    this.metadata = metadata || {};
+    this.open = true;
+    this.destroyed = false;
+    this._handlers = new Map();
+    this._send = send;
+    this._closeTimer = 0;
+  }
+
+  on(event, handler) {
+    if (typeof handler !== 'function') return this;
+    if (!this._handlers.has(event)) this._handlers.set(event, new Set());
+    this._handlers.get(event).add(handler);
+    return this;
+  }
+
+  off(event, handler) {
+    const set = this._handlers.get(event);
+    if (set) set.delete(handler);
+    return this;
+  }
+
+  emit(event, ...args) {
+    const set = this._handlers.get(event);
+    if (!set) return;
+    for (const handler of Array.from(set)) {
+      try {
+        handler(...args);
+      } catch (error) {
+        console.warn('[Relay] handler error', error);
+      }
+    }
+  }
+
+  send(payload) {
+    if (!this.open) throw new Error('RELAY_SOCKET_CLOSED');
+    this._send(payload, this.peer);
+    return true;
+  }
+
+  close() {
+    if (!this.open) return;
+    this.open = false;
+    this.destroyed = true;
+    // _dropConnection закрывает сокет из обработчика close; выносим событие
+    // из текущего стека, чтобы не уйти в рекурсию.
+    window.clearTimeout(this._closeTimer);
+    this._closeTimer = window.setTimeout(() => this.emit('close'), 0);
+  }
+}
+
+// =============================================================================
 // СЕТЬ — PeerJS
 // =============================================================================
 
@@ -3497,6 +3704,23 @@ class NetworkManager {
     this.peer = null;
     this.session = null;
     this.connected = false;
+
+    // Транспорт текущей сессии: 'peerjs' (старый путь) или 'relay'
+    // (Trystero через публичные relay-сети).
+    this.transport = 'peerjs';
+    this.room = null;
+    this._relay = null;
+    this._relaySelfId = null;
+    this._relayAction = null;
+    this._relayAnnounceTimer = 0;
+    this._relaySockets = new Map();
+    this._relayMeta = new Map();
+    this._relayPlan = null;
+    this._relayRole = null;
+    this._relayVoiceStreams = new Set();
+    this._relayJoinWaiter = null;
+    this._netPref = { mode: 'auto', custom: '' };
+    this._lastProbe = null;
 
     this.roster = new Map();        // id -> { id, name, host, slot, ping, joinedAt }
     this.connections = new Map();   // host: clientId -> DataConnection
@@ -3548,10 +3772,17 @@ class NetworkManager {
   }
 
   get isActive() {
-    return Boolean(this.session && this.peer && !this.peer.destroyed);
+    if (!this.session) return false;
+    if (this.transport === 'relay') return Boolean(this.room && this._relaySelfId);
+    return Boolean(this.peer && !this.peer.destroyed);
+  }
+
+  get usesRelay() {
+    return this.transport === 'relay';
   }
 
   get selfId() {
+    if (this.transport === 'relay') return this._relaySelfId;
     return this.peer && !this.peer.destroyed ? this.peer.id : null;
   }
 
@@ -3573,6 +3804,18 @@ class NetworkManager {
 
   setLocalStateProvider(provider) {
     this._localStateProvider = provider;
+  }
+
+  /** Настройки канала из «Настроек»: режим и необязательный свой relay. */
+  setNetworkPreference(pref = {}) {
+    this._netPref = {
+      mode: NET_TRANSPORTS.includes(pref.mode) ? pref.mode : 'auto',
+      custom: String(pref.custom || '').trim().slice(0, 160),
+    };
+  }
+
+  get networkPreference() {
+    return { ...this._netPref };
   }
 
   _displayName() {
@@ -3765,7 +4008,7 @@ class NetworkManager {
   }
 
   _heartbeat() {
-    if (!this.session || !this.peer || this.peer.destroyed) return;
+    if (!this.session || !this.isActive) return;
     const now = performance.now();
     const timeout = CONFIG.network.peerTimeout * 1000;
 
@@ -3780,7 +4023,7 @@ class NetworkManager {
           this._dropConnection(id, 'timeout');
           continue;
         }
-        if (local) this._send(conn, { t: 'state', id: this.peer.id, s: local });
+        if (local) this._send(conn, { t: 'state', id: this.selfId, s: local });
         this._send(conn, { t: 'ping', ts: now });
       }
     } else if (this._hostConn) {
@@ -3807,10 +4050,618 @@ class NetworkManager {
   }
 
   // ---------------------------------------------------------------------------
-  // Создание лобби
+  // Выбор канала сигнализации
   // ---------------------------------------------------------------------------
 
+  _customRelayUrl() {
+    const raw = String(this._netPref.custom || '').trim();
+    if (!/^wss?:\/\/\S+$/i.test(raw)) return '';
+    return raw;
+  }
+
+  _relayBuckets(cfg, strategies, custom) {
+    const buckets = [];
+    if (custom) {
+      // Свой узел проверяется первым: тип определяем по адресу.
+      const strategy = /\/mqtt(\?|$)/i.test(custom) ? 'mqtt' : 'torrent';
+      buckets.push({ strategy, urls: [custom], custom: true });
+    }
+    for (const strategy of strategies) {
+      const urls = (cfg.transports[strategy] || []).filter((url) => url !== custom);
+      if (urls.length) buckets.push({ strategy, urls });
+    }
+    return buckets;
+  }
+
+  _probeBucket(bucket) {
+    const mqtt = bucket.strategy === 'mqtt';
+    return Promise.all(bucket.urls.map((url) => probeSocket(url, { mqtt })));
+  }
+
+  async probeAll() {
+    const cfg = CONFIG.network.relay;
+    const custom = this._customRelayUrl();
+    const mode = this._netPref.mode;
+    const strategies = mode === 'auto' || mode === 'peerjs' ? cfg.order.slice() : [mode];
+    const peerjsProbe = probePeerJs();
+    const buckets = await Promise.all(
+      this._relayBuckets(cfg, strategies, custom).map(async (bucket) => {
+        const results = await this._probeBucket(bucket);
+        return { ...bucket, results };
+      }),
+    );
+    const peerjs = await peerjsProbe;
+    const round = {
+      at: Date.now(),
+      mode: this._netPref.mode,
+      buckets,
+      results: buckets.flatMap((bucket) => bucket.results),
+      peerjs,
+    };
+    this._lastProbe = round;
+    this.bus.emit('network:probe', round);
+    return round;
+  }
+
+  /**
+   * Возвращает { strategy, urls } либо null, если ни один канал не отвечает.
+   * 'auto' перебирает relay-сети и в последнюю очередь пробует PeerJS.
+   */
+  async _preparePlan() {
+    const cfg = CONFIG.network.relay;
+    const mode = this._netPref.mode;
+
+    if (mode === 'peerjs') {
+      this._lastProbe = { at: Date.now(), mode, buckets: [], results: [], peerjs: null };
+      return { strategy: 'peerjs', mode, urls: [] };
+    }
+
+    const custom = this._customRelayUrl();
+    const strategies = mode === 'auto' ? cfg.order.slice() : [mode];
+    // Проверяем каналы по очереди и останавливаемся на первом живом:
+    // обычно это занимает меньше секунды вместо ожидания всех реле.
+    const buckets = [];
+    let chosen = null;
+    const names = { mqtt: 'MQTT', torrent: 'WEBTORRENT', nostr: 'NOSTR' };
+    for (const bucket of this._relayBuckets(cfg, strategies, custom)) {
+      // Пользователь видит, какой канал проверяется прямо сейчас.
+      this._setStatus('signaling', `ПРОВЕРКА КАНАЛА ${names[bucket.strategy] || bucket.strategy}...`);
+      const limit = Math.min(bucket.urls.length, 3);
+      const partial = { strategy: bucket.strategy, urls: bucket.urls.slice(0, limit) };
+      const results = await this._probeBucket(partial);
+      const alive = results.filter((result) => result.ok);
+      buckets.push({ ...bucket, results, alive });
+      if (alive.length) {
+        chosen = {
+          strategy: bucket.strategy,
+          mode,
+          urls: alive
+            .map((result) => result.url)
+            .slice(0, Math.max(1, cfg.redundancy)),
+        };
+        break;
+      }
+    }
+
+    const peerjs = mode === 'auto' && !chosen ? await probePeerJs() : null;
+    const round = {
+      at: Date.now(),
+      mode,
+      buckets,
+      results: buckets.flatMap((bucket) => bucket.results),
+      peerjs,
+    };
+    this._lastProbe = round;
+    this.bus.emit('network:probe', round);
+
+    if (chosen) return { ...chosen, round };
+
+    // Реле не ответили: в авто-режиме остаётся старый PeerJS Cloud.
+    if (mode === 'auto' && peerjs && peerjs.ok) {
+      return { strategy: 'peerjs', mode, urls: [], round };
+    }
+    return null;
+  }
+
   async hostLobby(options = {}) {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      const offline = { reason: 'offline', message: 'НЕТ ПОДКЛЮЧЕНИЯ К ИНТЕРНЕТУ. ПРОВЕРЬТЕ СЕТЬ И ПОВТОРИТЕ.' };
+      this.bus.emit('network:error', offline);
+      return { ok: false, ...offline };
+    }
+
+    const token = (this._hostToken || 0) + 1;
+    this._hostToken = token;
+    this._setStatus('signaling', 'ПОИСК КАНАЛА СВЯЗИ...');
+
+    let plan = null;
+    try {
+      plan = await this._preparePlan();
+    } catch (error) {
+      console.warn('[Net] Не удалось проверить каналы', error);
+      plan = null;
+    }
+
+    if (token !== this._hostToken) {
+      return { ok: false, reason: 'cancelled', message: 'СЕАНС ОТМЕНЁН.' };
+    }
+    if (!plan) {
+      this._setStatus('error');
+      const message = 'НЕ УДАЛОСЬ ОТКРЫТЬ КАНАЛ СВЯЗИ. ОТКРОЙТЕ «НАСТРОЙКИ» → «ПРОВЕРИТЬ СВЯЗЬ» И ВЫБЕРИТЕ ДРУГОЙ КАНАЛ.';
+      this.bus.emit('network:error', { reason: 'network', message });
+      return { ok: false, reason: 'network', message };
+    }
+    if (plan.strategy === 'peerjs') return this._hostWithPeerJs(options);
+    return this._hostWithRelay(options, plan);
+  }
+
+  async joinLobby(code) {
+    const clean = this.sanitizeCode(code);
+    const length = CONFIG.network.lobbyCodeLength;
+
+    if (clean.length !== length) {
+      return {
+        ok: false,
+        reason: 'invalid-code',
+        message: `КОД ЛОББИ СОСТОИТ ИЗ ${length} СИМВОЛОВ.`,
+      };
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      const offline = { reason: 'offline', message: 'НЕТ ПОДКЛЮЧЕНИЯ К ИНТЕРНЕТУ. ПРОВЕРЬТЕ СЕТЬ И ПОВТОРИТЕ.' };
+      this.bus.emit('network:error', offline);
+      return { ok: false, ...offline };
+    }
+
+    const token = (this._hostToken || 0) + 1;
+    this._hostToken = token;
+    this._setStatus('signaling', 'ПОИСК КАНАЛА СВЯЗИ...');
+
+    let plan = null;
+    try {
+      plan = await this._preparePlan();
+    } catch (error) {
+      console.warn('[Net] Не удалось проверить каналы', error);
+      plan = null;
+    }
+
+    if (token !== this._hostToken) {
+      return { ok: false, reason: 'cancelled', message: 'ПОДКЛЮЧЕНИЕ ОТМЕНЕНО.' };
+    }
+    if (!plan) {
+      this._setStatus('error');
+      const message = 'НЕ УДАЛОСЬ ОТКРЫТЬ КАНАЛ СВЯЗИ. ОТКРОЙТЕ «НАСТРОЙКИ» → «ПРОВЕРИТЬ СВЯЗЬ» И ВЫБЕРИТЕ ДРУГОЙ КАНАЛ.';
+      this.bus.emit('network:error', { reason: 'network', message });
+      return { ok: false, reason: 'network', message };
+    }
+    if (plan.strategy === 'peerjs') return this._joinWithPeerJs(clean);
+    return this._joinWithRelay(clean, plan);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Relay-транспорт (Trystero)
+  // ---------------------------------------------------------------------------
+
+  _relaySend(payload, target) {
+    if (!this._relayAction) return false;
+    try {
+      const promise = target
+        ? this._relayAction.send(payload, { target })
+        : this._relayAction.send(payload);
+      if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  _startRelayAnnounce(role) {
+    window.clearInterval(this._relayAnnounceTimer);
+    const announce = () => {
+      if (!this.room || this._destroying) return;
+      this._relaySend({
+        t: 'net',
+        role,
+        code: this.session ? this.session.code : '',
+        name: this._displayName(),
+        v: CONFIG.version,
+      });
+    };
+    announce();
+    this._relayAnnounceTimer = window.setInterval(
+      announce,
+      Math.max(400, CONFIG.network.relay.announceInterval),
+    );
+  }
+
+  async _openRelayRoom(code, role, plan) {
+    let mod = null;
+    try {
+      mod = await loadRelayModule();
+    } catch (error) {
+      throw Object.assign(new Error('RELAY_LIB_UNAVAILABLE'), { type: 'relay-lib' });
+    }
+    const cfg = CONFIG.network.relay;
+    const joiners = { mqtt: mod.joinMqtt, torrent: mod.joinTorrent, nostr: mod.joinNostr };
+    const join = joiners[plan.strategy];
+    if (typeof join !== 'function') {
+      throw Object.assign(new Error('RELAY_STRATEGY_UNAVAILABLE'), { type: 'relay' });
+    }
+
+    const relays = plan.urls && plan.urls.length ? plan.urls.slice() : (cfg.transports[plan.strategy] || []).slice(0, 2);
+    this.transport = 'relay';
+    this._relayPlan = plan;
+    this._relaySelfId = mod.selfId;
+    this._relay = { plan, module: mod, relays };
+    this.peer = { id: mod.selfId, destroyed: false };
+
+    const room = join(
+      {
+        appId: cfg.appId,
+        password: cfg.password,
+        relayConfig: { urls: relays, redundancy: cfg.redundancy },
+        rtcConfig: { iceServers: CONFIG.network.iceServers },
+      },
+      `${CONFIG.network.prefix}${code}`,
+      {
+        onJoinError: (error) => {
+          console.warn('[Relay] Ошибка входа в комнату', error);
+          if (this._relayJoinWaiter) {
+            const waiter = this._relayJoinWaiter;
+            this._relayJoinWaiter = null;
+            waiter.reject({
+              type: 'network',
+              reason: 'network',
+              message: 'НЕ УДАЛОСЬ ЗАКРЕПИТЬСЯ НА RELAY-УЗЛЕ. ПРОВЕРЬТЕ КАНАЛ СВЯЗИ.',
+            });
+          }
+        },
+      },
+    );
+
+    this.room = room;
+    this._relay = { plan, module: mod, relays, room };
+    this._relayAction = room.makeAction('mx');
+    this._relayAction.onMessage = (data, context) => {
+      this._onRelayMessage(data, context && context.peerId);
+    };
+
+    room.onPeerJoin = (id) => this._onRelayPeerJoin(id);
+    room.onPeerLeave = (id) => this._onRelayPeerLeave(id);
+    room.onPeerStream = (stream, id) => this._onRelayStream(id, stream);
+
+    this._relayRole = role;
+    this._startRelayAnnounce(role);
+    return { room, selfId: mod.selfId, relays };
+  }
+
+  _ensureRelaySocket(id, accept) {
+    if (!this.room || !id || id === this._relaySelfId) return null;
+    let conn = this._relaySockets.get(id);
+    if (conn && !conn.open) {
+      // После таймаута или разрыва сокет закрыт: даём паре новый шанс.
+      this._relaySockets.delete(id);
+      conn = null;
+    }
+    if (conn) {
+      if (accept && !conn._accepted && conn.open) {
+        conn._accepted = true;
+        this._acceptConnection(conn);
+      }
+      return conn.open ? conn : null;
+    }
+    const meta = this._relayMeta.get(id) || {};
+    conn = new RelaySocket({
+      peer: id,
+      metadata: { name: meta.name || '' },
+      send: (payload, target) => this._relaySend(payload, target),
+    });
+    this._relaySockets.set(id, conn);
+    if (accept) {
+      conn._accepted = true;
+      this._acceptConnection(conn);
+    }
+    return conn;
+  }
+
+  _onRelayPeerJoin(id) {
+    if (this._destroying || !this.session) return;
+    // Trystero не хранит локальные потоки для будущих соединений: новому
+    // пиру микрофон нужно отдать заново, иначе он останется без голоса.
+    for (const stream of this._relayVoiceStreams) {
+      try {
+        const pending = this.room.addStream(stream, { target: id });
+        if (Array.isArray(pending)) pending.forEach((item) => item && item.catch && item.catch(() => {}));
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    if (this.isHost) this._ensureRelaySocket(id, true);
+  }
+
+  _onRelayPeerLeave(id) {
+    const conn = this._relaySockets.get(id);
+    this._relaySockets.delete(id);
+    this._relayMeta.delete(id);
+    if (conn) {
+      conn.open = false;
+      conn.destroyed = true;
+    }
+    this._dropConnection(id, 'close');
+    if (!this.isHost && (id === this._hostId || id === (this._hostConn && this._hostConn.peer))) {
+      this._failSession('host-left');
+    }
+  }
+
+  _onRelayMessage(data, fromId) {
+    if (!data || typeof data !== 'object' || !fromId) return;
+    if (data.t === 'net') {
+      this._relayMeta.set(fromId, { name: data.name || '', role: data.role || 'guest' });
+      if (this.isHost) {
+        if (data.role === 'guest') this._ensureRelaySocket(fromId, true);
+        return;
+      }
+      if (data.role === 'host' && this.session && data.code === this.session.code) {
+        this._onRelayHost(fromId);
+      }
+      return;
+    }
+    const conn = this._relaySockets.get(fromId)
+      || (this.isHost ? this._ensureRelaySocket(fromId, true) : null);
+    if (conn && conn.open) conn.emit('data', data);
+  }
+
+  _onRelayHost(hostId) {
+    if (!this.session || this.isHost || this._hostConn) return;
+    this._hostId = hostId;
+    const conn = this._ensureRelaySocket(hostId, false);
+    if (!conn) return;
+    this._hostConn = conn;
+    this._hostLastSeen = performance.now();
+    this._setStatus('connecting');
+    const waiter = this._relayJoinWaiter;
+    if (!waiter) return;
+    this._awaitWelcome(conn, CONFIG.network.relay.joinTimeout).then(
+      (welcome) => waiter.resolve(welcome),
+      (error) => waiter.reject(error),
+    );
+  }
+
+  _onRelayStream(id, stream) {
+    if (!stream || !this._voice) return;
+    this._voice.attachRemoteStream(id, stream);
+  }
+
+  publishVoiceStream(stream) {
+    if (!stream || this.transport !== 'relay' || !this.room) return;
+    if (this._relayVoiceStreams.has(stream)) return;
+    this._relayVoiceStreams.add(stream);
+    try {
+      const pending = this.room.addStream(stream);
+      if (Array.isArray(pending)) pending.forEach((item) => item && item.catch && item.catch(() => {}));
+    } catch (error) {
+      console.warn('[Relay] Не удалось добавить микрофон', error);
+    }
+  }
+
+  unpublishVoiceStream(stream) {
+    if (!stream || !this._relayVoiceStreams.has(stream)) return;
+    this._relayVoiceStreams.delete(stream);
+    if (!this.room) return;
+    try {
+      this.room.removeStream(stream);
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  _leaveRelayRoom() {
+    window.clearInterval(this._relayAnnounceTimer);
+    this._relayAnnounceTimer = 0;
+    const room = this.room;
+    this.room = null;
+    this._relay = null;
+    this._relayAction = null;
+    this._relaySelfId = null;
+    this._relayPlan = null;
+    this._relayRole = null;
+    this._relayJoinWaiter = null;
+    this._relayVoiceStreams.clear();
+    for (const conn of this._relaySockets.values()) {
+      conn.open = false;
+      conn.destroyed = true;
+    }
+    this._relaySockets.clear();
+    this._relayMeta.clear();
+    if (room) {
+      try {
+        Promise.resolve(room.leave()).catch(() => {});
+      } catch (error) {
+        /* ignore */
+      }
+    }
+  }
+
+  async _hostWithRelay(options, plan) {
+    this.leave({ silent: true });
+    this._destroying = false;
+    this._sessionFailed = false;
+
+    const length = CONFIG.network.lobbyCodeLength;
+    const code = options && options.code ? this.sanitizeCode(options.code) : this._generateCode();
+    if (code.length !== length) {
+      return {
+        ok: false,
+        reason: 'invalid-code',
+        message: `КОД ЛОББИ СОСТОИТ ИЗ ${length} СИМВОЛОВ.`,
+      };
+    }
+
+    this.session = {
+      code,
+      host: true,
+      mode: 'online',
+      transport: 'relay',
+      strategy: plan.strategy,
+      createdAt: Date.now(),
+      maxPlayers: CONFIG.network.maxPlayers,
+      peers: [],
+    };
+    this._setStatus('signaling');
+    this.bus.emit('network:session', this.session);
+
+    try {
+      const opened = await this._openRelayRoom(code, 'host', plan);
+      if (!this.session) {
+        this._leaveRelayRoom();
+        return { ok: false, reason: 'cancelled', message: 'СЕАНС ОТМЕНЁН.' };
+      }
+
+      const hostName = this._displayName() || 'ПАССАЖИР 1';
+      this.roster.clear();
+      this.roster.set(opened.selfId, {
+        id: opened.selfId,
+        name: hostName,
+        host: true,
+        slot: 1,
+        ping: 0,
+        joinedAt: Date.now(),
+      });
+
+      this.connected = true;
+      this._startHeartbeat();
+      this._setStatus('hosting', `КАНАЛ ${plan.strategy.toUpperCase()}`);
+      this.bus.emit('network:lobbyReady', {
+        session: this.session,
+        code,
+        transport: 'relay',
+        strategy: plan.strategy,
+        relays: opened.relays,
+      });
+      this._emitRoster();
+      return {
+        ok: true,
+        session: this.session,
+        code,
+        transport: 'relay',
+        strategy: plan.strategy,
+        relay: opened.relays[0] || '',
+      };
+    } catch (error) {
+      this._leaveRelayRoom();
+      this.peer = null;
+      this.session = null;
+      this.connected = false;
+      this.transport = 'peerjs';
+      this._setStatus('error');
+      const mapped = this._mapError(error, 'host');
+      this.bus.emit('network:error', mapped);
+      return { ok: false, reason: mapped.reason, message: mapped.message };
+    }
+  }
+
+  async _joinWithRelay(code, plan) {
+    this.leave({ silent: true });
+    this._destroying = false;
+    this._sessionFailed = false;
+
+    this.session = {
+      code,
+      host: false,
+      mode: 'online',
+      transport: 'relay',
+      strategy: plan.strategy,
+      createdAt: Date.now(),
+      maxPlayers: CONFIG.network.maxPlayers,
+      peers: [],
+    };
+    this._setStatus('signaling');
+    this.bus.emit('network:session', this.session);
+
+    try {
+      // Ждём хоста ещё до входа в комнату: его объявление может прийти
+      // в тот же тик, что и подписка на relay.
+      const welcomePromise = new Promise((resolve, reject) => {
+        let timer = 0;
+        const done = (fn, value) => {
+          window.clearTimeout(timer);
+          if (this._relayJoinWaiter && this._relayJoinWaiter.resolve === resolve) {
+            this._relayJoinWaiter = null;
+          }
+          fn(value);
+        };
+        this._relayJoinWaiter = {
+          resolve: (value) => done(resolve, value),
+          reject: (error) => done(reject, error),
+        };
+        timer = window.setTimeout(() => {
+          done(reject, {
+            type: 'not-found',
+            reason: 'not-found',
+            message: 'ЛОББИ НЕ НАЙДЕНО: ХОСТ НЕ В СЕТИ ИЛИ КОД НЕВЕРНЫЙ.',
+          });
+        }, CONFIG.network.relay.joinTimeout + 1500);
+      });
+
+      const opened = await this._openRelayRoom(code, 'guest', plan);
+      const welcome = await welcomePromise;
+
+      if (!this.session) {
+        this._leaveRelayRoom();
+        return { ok: false, reason: 'cancelled', message: 'ПОДКЛЮЧЕНИЕ ОТМЕНЕНО.' };
+      }
+
+      this._hostId = welcome.hostId || (this._hostConn && this._hostConn.peer);
+      this.roster.clear();
+      if (Array.isArray(welcome.players)) {
+        for (const player of welcome.players) {
+          if (player && player.id) this.roster.set(player.id, player);
+        }
+      }
+      if (!this.roster.has(opened.selfId)) {
+        this.roster.set(opened.selfId, {
+          id: opened.selfId,
+          name: this._displayName() || 'ПАССАЖИР',
+          host: false,
+          slot: this.roster.size + 1,
+          ping: null,
+          joinedAt: Date.now(),
+        });
+      }
+
+      this.session.code = welcome.code || code;
+      this.connected = true;
+      this._hostLastSeen = performance.now();
+      this._startHeartbeat();
+      this._setStatus('connected');
+      this._emitRoster();
+      this.bus.emit('network:joined', { session: this.session, code: this.session.code });
+      return {
+        ok: true,
+        session: this.session,
+        code: this.session.code,
+        transport: 'relay',
+        strategy: plan.strategy,
+      };
+    } catch (error) {
+      this._leaveRelayRoom();
+      this.peer = null;
+      this._hostConn = null;
+      this.session = null;
+      this.connected = false;
+      this.transport = 'peerjs';
+      this._setStatus('error');
+      const mapped = this._mapError(error, 'join');
+      this.bus.emit('network:error', mapped);
+      return { ok: false, reason: mapped.reason, message: mapped.message };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Создание лобби (PeerJS — резервный путь)
+  // ---------------------------------------------------------------------------
+
+  async _hostWithPeerJs(options = {}) {
     this.leave({ silent: true });
     this._destroying = false;
     this._sessionFailed = false;
@@ -3957,7 +4808,7 @@ class NetworkManager {
         v: CONFIG.version,
         code: this.session.code,
         selfId: id,
-        hostId: this.peer.id,
+        hostId: this.selfId,
         players: this._rosterArray(),
         maxPlayers: CONFIG.network.maxPlayers,
       });
@@ -3997,7 +4848,7 @@ class NetworkManager {
 
   _broadcastRoster() {
     if (!this.isHost) return;
-    this._broadcast({ t: 'roster', players: this._rosterArray(), hostId: this.peer.id });
+    this._broadcast({ t: 'roster', players: this._rosterArray(), hostId: this.selfId });
   }
 
   _onData(conn, data) {
@@ -4035,6 +4886,16 @@ class NetworkManager {
           this._broadcastRoster();
           this._emitRoster();
         }
+        // Welcome мог уйти раньше, чем у гостя открылся канал: повторяем.
+        this._send(conn, {
+          t: 'welcome',
+          v: CONFIG.version,
+          code: this.session ? this.session.code : '',
+          selfId: fromId,
+          hostId: this.selfId,
+          players: this._rosterArray(),
+          maxPlayers: CONFIG.network.maxPlayers,
+        });
         break;
       }
       case 'bye': {
@@ -4135,7 +4996,7 @@ class NetworkManager {
   // Подключение к лобби
   // ---------------------------------------------------------------------------
 
-  async joinLobby(code) {
+  async _joinWithPeerJs(code) {
     const clean = this.sanitizeCode(code);
     const length = CONFIG.network.lobbyCodeLength;
 
@@ -4222,7 +5083,7 @@ class NetworkManager {
     }
   }
 
-  _awaitWelcome(conn) {
+  _awaitWelcome(conn, timeout = CONFIG.network.joinTimeout) {
     return new Promise((resolve, reject) => {
       let settled = false;
       const finish = (fn, value) => {
@@ -4271,7 +5132,7 @@ class NetworkManager {
           reason: 'timeout',
           message: 'ХОСТ НЕ ОТВЕЧАЕТ. ПРОВЕРЬТЕ КОД И ПОВТОРИТЕ ПОПЫТКУ.',
         });
-      }, CONFIG.network.joinTimeout);
+      }, timeout);
     });
   }
 
@@ -4310,10 +5171,10 @@ class NetworkManager {
 
   _mapError(error, mode) {
     const type = (error && (error.type || error.reason)) || 'unknown';
-    if (type === 'peer-lib') {
+    if (type === 'peer-lib' || type === 'relay-lib') {
       return {
         reason: 'peer-lib',
-        message: 'НЕ УДАЛОСЬ ЗАГРУЗИТЬ СЕТЕВОЙ МОДУЛЬ PEERJS. ПРОВЕРЬТЕ СОЕДИНЕНИЕ И ПЕРЕЗАГРУЗИТЕ.',
+        message: 'НЕ УДАЛОСЬ ЗАГРУЗИТЬ СЕТЕВОЙ МОДУЛЬ. ПРОВЕРЬТЕ СОЕДИНЕНИЕ И ПЕРЕЗАГРУЗИТЕ СТРАНИЦУ.',
       };
     }
     if (type === 'unavailable-id') {
@@ -4334,7 +5195,10 @@ class NetworkManager {
       };
     }
     if (type === 'network' || type === 'server-error' || type === 'socket-error') {
-      return { reason: 'network', message: 'НЕТ СВЯЗИ С СИГНАЛЬНЫМ СЕРВЕРОМ. ПРОВЕРЬТЕ ИНТЕРНЕТ.' };
+      return {
+        reason: 'network',
+        message: 'КАНАЛ СВЯЗИ НЕДОСТУПЕН. ОТКРОЙТЕ «НАСТРОЙКИ» → «ПРОВЕРИТЬ СВЯЗЬ» И ВЫБЕРИТЕ ДРУГОЙ КАНАЛ.',
+      };
     }
     return { reason: 'unknown', message: 'НЕ УДАЛОСЬ УСТАНОВИТЬ СВЯЗЬ. ПОВТОРИТЕ ПОПЫТКУ.' };
   }
@@ -4350,6 +5214,8 @@ class NetworkManager {
 
   leave({ silent = false } = {}) {
     this._destroying = true;
+    // Отменяет незавершённую проверку каналов / создание лобби.
+    this._hostToken = (this._hostToken || 0) + 1;
     window.clearTimeout(this._joinTimer);
     window.clearTimeout(this._reconnectTimer);
     this._stopHeartbeat();
@@ -4359,6 +5225,8 @@ class NetworkManager {
     const hadSession = Boolean(this.session);
 
     if (this._voice) this._voice.leave();
+    this._leaveRelayRoom();
+    this.transport = 'peerjs';
 
     if (this.isHost) {
       for (const conn of this.connections.values()) {
@@ -4425,7 +5293,7 @@ class NetworkManager {
   // ---------------------------------------------------------------------------
 
   update(dt) {
-    if (!this.session || !this.peer || this.peer.destroyed) return;
+    if (!this.session || !this.isActive) return;
 
     this._tickAccumulator += dt;
     if (this._tickAccumulator >= 1 / CONFIG.network.tickRate) {
@@ -4433,7 +5301,7 @@ class NetworkManager {
       const local = this._localStateProvider ? this._localStateProvider() : null;
       if (local) {
         if (this.isHost) {
-          const packet = { t: 'state', id: this.peer.id, s: local };
+          const packet = { t: 'state', id: this.selfId, s: local };
           for (const conn of this.connections.values()) this._send(conn, packet);
         } else if (this._hostConn) {
           this._send(this._hostConn, { t: 'state', s: local });
@@ -4910,6 +5778,12 @@ class VoiceChat {
       window.addEventListener('blur', this._onBlur);
     }
 
+    // Поток мог прийти раньше, чем появился AudioContext: гость получает
+    // голос хоста ещё в лобби. Собираем отложенное позиционное аудио.
+    for (const [id, entry] of this.peers) {
+      if (entry.stream && !entry.audio && entry.object3D) this._buildAudio(id, entry);
+    }
+
     this._emitStatus(true);
     return true;
   }
@@ -4979,7 +5853,11 @@ class VoiceChat {
 
     if (!this.enabled) {
       this._releaseLocal();
-      for (const id of Array.from(this.peers.keys())) this._closePeer(id);
+      // В relay-режиме потоки живут в общем WebRTC-соединении: закрывать
+      // записи нельзя, иначе после включения голоса не вернуть чужой звук.
+      if (!(this.network && this.network.usesRelay)) {
+        for (const id of Array.from(this.peers.keys())) this._closePeer(id);
+      }
       this._emitStatus(true);
       return;
     }
@@ -5015,6 +5893,9 @@ class VoiceChat {
       const result = await this.audio.acquireMic('voice');
       this.localStream = result.stream;
       this._applyTrackState();
+      if (this.network && this.network.publishVoiceStream) {
+        this.network.publishVoiceStream(this.localStream);
+      }
       this._emitStatus(true);
       return this.localStream;
     } catch (error) {
@@ -5026,6 +5907,9 @@ class VoiceChat {
   }
 
   _releaseLocal() {
+    if (this.localStream && this.network && this.network.unpublishVoiceStream) {
+      this.network.unpublishVoiceStream(this.localStream);
+    }
     this.localStream = null;
     if (this.localAnalyser) {
       try {
@@ -5101,7 +5985,7 @@ class VoiceChat {
   }
 
   _ensureCall(remoteId) {
-    if (!this.enabled || !this.network || !this.network.peer) return;
+    if (!this.enabled || !this.network || !this.network.isActive) return;
     const selfId = this.network.selfId;
     if (!selfId || remoteId === selfId) return;
 
@@ -5112,6 +5996,14 @@ class VoiceChat {
       entry = this._emptyPeer();
       this.peers.set(remoteId, entry);
     }
+
+    if (this.network.usesRelay) {
+      // Trystero добавляет микрофон в общий канал; отдельный «звонок»
+      // не нужен, входящий поток приходит в attachRemoteStream().
+      if (this.localStream) this.network.publishVoiceStream(this.localStream);
+      return;
+    }
+
     if (entry.call) return;
 
     // Инициатор — меньший peer id. Второй ждёт звонка, но через 6 секунд
@@ -5289,6 +6181,13 @@ class VoiceChat {
     if (this.network && this.network.roster.has(remoteId) && this.enabled) {
       this._scheduleRetry(remoteId);
     }
+  }
+
+  /** Входящий поток из relay-канала (Trystero onPeerStream). */
+  attachRemoteStream(remoteId, stream) {
+    if (!remoteId || !stream) return;
+    if (this.network && remoteId === this.network.selfId) return;
+    this._attachStream(remoteId, stream);
   }
 
   _attachStream(remoteId, stream) {
@@ -5779,6 +6678,13 @@ class UIManager {
       voiceHint: $('#voice-hint'),
       callsign: $('#callsign'),
 
+      netTransport: $('#net-transport'),
+      netStatus: $('#net-status'),
+      netResults: $('#net-results'),
+      netTest: $('#btn-net-test'),
+      netTestLabel: $('#btn-net-test-label'),
+      relayCustom: $('#relay-custom'),
+
       clock: $('#menu-clock'),
     };
 
@@ -5790,9 +6696,12 @@ class UIManager {
 
     this.bus.on('player:stamina', (state) => this.setStamina(state));
     this.bus.on('network:lobbyCreated', (session) => this.setLobbyCode(session.code));
-    this.bus.on('network:lobbyReady', ({ code }) => {
+    this.bus.on('network:lobbyReady', ({ code, strategy }) => {
       this.setLobbyCode(code);
-      this.setNetworkStatus({ status: 'hosting' });
+      this.setNetworkStatus({
+        status: 'hosting',
+        detail: strategy ? `КАНАЛ ${String(strategy).toUpperCase()}` : null,
+      });
     });
     this.bus.on('network:roster', (roster) => this.onRoster(roster));
     this.bus.on('network:status', (status) => this.setNetworkStatus(status));
@@ -5933,6 +6842,34 @@ class UIManager {
       this.el.callsign.addEventListener('blur', commit);
     }
 
+    if (this.el.netTransport) {
+      this.el.netTransport.addEventListener('change', () => {
+        const mode = this.el.netTransport.value;
+        this.store.save({ netTransport: mode });
+        this._syncNetworkPreference();
+        this.showToast('КАНАЛ СВЯЗИ ОБНОВЛЁН // ПРИМЕНИТСЯ К СЛЕДУЮЩЕМУ ЛОББИ', 'info', 3200);
+      });
+    }
+
+    if (this.el.relayCustom) {
+      let lastCustom = this.store.values.relayCustom || '';
+      const commit = () => {
+        const value = this.el.relayCustom.value.trim().slice(0, 160);
+        if (value === lastCustom) return;
+        lastCustom = value;
+        this.el.relayCustom.value = value;
+        this.store.save({ relayCustom: value });
+        this._syncNetworkPreference();
+        this.showToast('СВОЙ RELAY-УЗЕЛ СОХРАНЁН', 'info', 2600);
+      };
+      this.el.relayCustom.addEventListener('change', commit);
+      this.el.relayCustom.addEventListener('blur', commit);
+    }
+
+    if (this.el.netTest) {
+      this.el.netTest.addEventListener('click', () => this._runNetworkTest());
+    }
+
     document.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') return;
       if (this._settingsOpen) {
@@ -5985,6 +6922,100 @@ class UIManager {
     if (this.el.voiceEnabled) this.el.voiceEnabled.checked = this.store.values.voiceEnabled !== false;
     this._applyVoiceModeUI(this.store.values.voiceMode);
     if (this.el.callsign) this.el.callsign.value = this.store.values.callsign || '';
+    if (this.el.netTransport) this.el.netTransport.value = this.store.values.netTransport || 'auto';
+    if (this.el.relayCustom) this.el.relayCustom.value = this.store.values.relayCustom || '';
+  }
+
+  _syncNetworkPreference() {
+    if (!this.network || !this.network.setNetworkPreference) return;
+    this.network.setNetworkPreference({
+      mode: this.store.values.netTransport,
+      custom: this.store.values.relayCustom,
+    });
+  }
+
+  _setNetStatus(text, state = 'idle') {
+    if (!this.el.netStatus) return;
+    this.el.netStatus.textContent = text;
+    this.el.netStatus.dataset.state = state;
+  }
+
+  _shortRelay(url) {
+    try {
+      const parsed = new URL(url);
+      const path = parsed.pathname && parsed.pathname !== '/' ? parsed.pathname : '';
+      return `${parsed.host}${path}`;
+    } catch (error) {
+      return String(url || '');
+    }
+  }
+
+  _renderNetResults(round) {
+    if (!this.el.netResults) return;
+    const labels = { mqtt: 'MQTT', torrent: 'TORRENT', nostr: 'NOSTR' };
+    const rows = [];
+    for (const bucket of round.buckets || []) {
+      for (const result of bucket.results || []) {
+        rows.push({
+          label: `${labels[bucket.strategy] || bucket.strategy} · ${this._shortRelay(result.url)}`,
+          ok: Boolean(result.ok),
+          text: result.ok ? `OK ${result.ms} мс` : (result.detail || 'нет'),
+        });
+      }
+    }
+    if (round.peerjs) {
+      rows.push({
+        label: 'PEERJS · 0.peerjs.com',
+        ok: Boolean(round.peerjs.ok),
+        text: round.peerjs.ok ? `OK ${round.peerjs.ms} мс` : (round.peerjs.detail || 'нет'),
+      });
+    }
+
+    this.el.netResults.textContent = '';
+    for (const row of rows) {
+      const item = document.createElement('li');
+      item.dataset.ok = String(row.ok);
+      const name = document.createElement('span');
+      name.textContent = row.label;
+      const value = document.createElement('span');
+      value.textContent = row.text;
+      item.append(name, value);
+      this.el.netResults.appendChild(item);
+    }
+    this.el.netResults.hidden = rows.length === 0;
+
+    const available = (round.buckets || []).filter((bucket) => (bucket.results || []).some((r) => r.ok));
+    if (available.length) {
+      this._setNetStatus(`${labels[available[0].strategy] || available[0].strategy} доступен`, 'active');
+    } else if (round.peerjs && round.peerjs.ok) {
+      this._setNetStatus('только PeerJS', 'requesting');
+    } else {
+      this._setNetStatus('каналы недоступны', 'error');
+    }
+  }
+
+  async _runNetworkTest() {
+    if (this._netTesting || !this.network) return;
+    this._netTesting = true;
+    const button = this.el.netTest;
+    if (button) button.disabled = true;
+    if (this.el.netTestLabel) this.el.netTestLabel.textContent = 'Проверка...';
+    this._setNetStatus('проверка...', 'requesting');
+    if (this.el.netResults) {
+      this.el.netResults.textContent = '';
+      this.el.netResults.hidden = true;
+    }
+    try {
+      const round = await this.network.probeAll();
+      this._renderNetResults(round);
+    } catch (error) {
+      console.warn('[Net] Проверка не удалась', error);
+      this._setNetStatus('ошибка проверки', 'error');
+    } finally {
+      this._netTesting = false;
+      if (button) button.disabled = false;
+      if (this.el.netTestLabel) this.el.netTestLabel.textContent = 'Проверить связь';
+    }
   }
 
   _applyVoiceModeUI(mode) {
@@ -6043,6 +7074,7 @@ class UIManager {
     this.bus.emit('settings:voiceEnabled', values.voiceEnabled);
     this.bus.emit('settings:voiceMode', values.voiceMode);
     this.bus.emit('settings:callsign', values.callsign || '');
+    this._syncNetworkPreference();
     this.audio.uiConfirm();
     this.showToast('НАСТРОЙКИ СБРОШЕНЫ К ЗАВОДСКИМ ЗНАЧЕНИЯМ', 'info');
   }
@@ -6450,8 +7482,8 @@ class UIManager {
   setNetworkStatus({ status, detail } = {}) {
     const map = {
       idle: ['СОЕДИНЕНИЕ НЕ УСТАНОВЛЕНО', 'idle'],
-      signaling: ['УСТАНОВКА СВЯЗИ С СЕРВЕРОМ...', 'pending'],
-      hosting: ['КАНАЛ ОТКРЫТ · ЖДЁМ ПАССАЖИРОВ', 'ok'],
+      signaling: [detail || 'УСТАНОВКА СВЯЗИ С СЕРВЕРОМ...', 'pending'],
+      hosting: [detail ? `${detail} · ЖДЁМ ПАССАЖИРОВ` : 'КАНАЛ ОТКРЫТ · ЖДЁМ ПАССАЖИРОВ', 'ok'],
       connecting: ['ПОДКЛЮЧЕНИЕ К ХОСТУ...', 'pending'],
       connected: ['СВЯЗЬ С ХОСТОМ УСТАНОВЛЕНА', 'ok'],
       reconnecting: [detail || 'ПЕРЕПОДКЛЮЧЕНИЕ...', 'warn'],
@@ -6848,6 +7880,10 @@ class Game {
     });
     this.network.setNameProvider(() => this.store.values.callsign || '');
     this.network.setVoiceChat(this.voice);
+    this.network.setNetworkPreference({
+      mode: this.store.values.netTransport,
+      custom: this.store.values.relayCustom,
+    });
     this.voice.setNetwork(this.network);
     this.remotePlayers.setNetwork(this.network);
 
@@ -7056,10 +8092,19 @@ class Game {
 
     this.session = this.network.session;
     this.ui.showLobby({ code: result.code, mode: 'host' });
+    const channelName = result.transport === 'relay' && result.strategy
+      ? String(result.strategy).toUpperCase()
+      : null;
+    // showLobby сбрасывает строку состояния — возвращаем название канала.
+    this.ui.setNetworkStatus({
+      status: 'hosting',
+      detail: channelName ? `КАНАЛ ${channelName}` : null,
+    });
+    const channel = channelName ? ` // КАНАЛ ${channelName}` : '';
     this.ui.showToast(
-      `ЛОББИ 06-${result.code} ОТКРЫТО // ПЕРЕДАЙТЕ КОД ЭКИПАЖУ`,
+      `ЛОББИ 06-${result.code} ОТКРЫТО${channel} // ПЕРЕДАЙТЕ КОД ЭКИПАЖУ`,
       'success',
-      6000,
+      6500,
     );
   }
 
