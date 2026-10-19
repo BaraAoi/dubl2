@@ -1,20 +1,20 @@
 /* ============================================================================
-   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть I
+   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть II
    ----------------------------------------------------------------------------
-   Единый ES-модуль игры (вантаж JS + Three.js r161 через import map).
+   Единый ES-модуль игры (ванильный JS + Three.js r161 + PeerJS 1.5).
    index.html содержит CSS и DOM; этот файл — вся логика:
      CONFIG            — настраиваемые константы
      EventBus          — слабая связь между системами
      SettingsStore     — сохранение настроек (localStorage)
-     AudioManager      — синтезированный эмбиент, шаги, UI-звуки, микрофон
+     AudioManager      — эмбиент, шаги, UI-звуки, микрофон (ref-counted)
      TextureFactory    — процедурные текстуры (без внешних ассетов)
      TrainCar          — геометрия, свет и атмосфера вагона
      PlayerController  — PointerLockControls, движение, выносливость, коллизии
-     NetworkManager    — заглушка для Части II (точка расширения)
+     NetworkManager    — PeerJS: лобби, роутинг данных, heartbeat, реконнект
+     RemotePlayers     — капсулы удалённых игроков, nametag, интерполяция
+     VoiceChat         — WebRTC-голос, позиционное аудио, «рация»
      UIManager         — экраны, HUD, настройки, микрофон
      Game              — сборка и жизненный цикл
-
-   Точки расширения для Части II отмечены комментариями [PART II].
    ========================================================================== */
 
 import * as THREE from 'three';
@@ -26,8 +26,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 // =============================================================================
 
 const CONFIG = {
-  version: '0.1.0',
-  part: 1,
+  version: '0.2.0',
+  part: 2,
   car: {
     width: 3.8,          // внутренняя ширина
     length: 32,          // внутренняя длина
@@ -55,14 +55,44 @@ const CONFIG = {
     spawn: { x: 0, z: 13.35 },
   },
   network: {
-    lobbyCodeLength: 4,
+    lobbyCodeLength: 5,
     tickRate: 20,
+    maxPlayers: 6,
+    prefix: 'nv06-',
+    heartbeatInterval: 1.0,
+    peerTimeout: 20.0,
+    joinTimeout: 14000,
+    reconnectDelay: 1600,
+    // Публичный PeerJS Cloud. Для продакшена укажите свой peerjs-server.
+    signaling: {
+      host: '0.peerjs.com',
+      port: 443,
+      secure: true,
+      path: '/',
+      key: 'peerjs',
+    },
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:global.stun.twilio.com:3478' },
+      // Для игроков за symmetric NAT добавьте сюда TURN (см. README).
+    ],
+  },
+  voice: {
+    refDistance: 2.2,
+    rolloff: 1.15,
+    maxDistance: 16,
+    fadeStart: 9.5,
+    fadeEnd: 14,
+    nametagDistance: 22,
+    radioGain: 0.9,
   },
 };
 
 const STATE = Object.freeze({
   BOOT: 'boot',
   MENU: 'menu',
+  LOBBY: 'lobby',
   DEPLOYING: 'deploying',
   PLAYING: 'playing',
   PAUSED: 'paused',
@@ -145,6 +175,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   volume: 0.7,
   sensitivity: 1.0,
   micTested: false,
+  voiceEnabled: true,
+  voiceMode: 'open', // 'open' | 'ptt'
+  callsign: '',
 });
 
 class SettingsStore {
@@ -167,6 +200,15 @@ class SettingsStore {
       }
       if (typeof parsed.micTested === 'boolean') {
         this.values.micTested = parsed.micTested;
+      }
+      if (typeof parsed.voiceEnabled === 'boolean') {
+        this.values.voiceEnabled = parsed.voiceEnabled;
+      }
+      if (parsed.voiceMode === 'open' || parsed.voiceMode === 'ptt') {
+        this.values.voiceMode = parsed.voiceMode;
+      }
+      if (typeof parsed.callsign === 'string') {
+        this.values.callsign = parsed.callsign.slice(0, 18);
       }
     } catch (error) {
       console.warn('[Settings] Не удалось прочитать localStorage', error);
@@ -214,20 +256,26 @@ class AudioManager {
     this._clackCountdown = 1.1;
     this._isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     this._sceneLevels = { menu: 0.56, game: 1, paused: 0.42 };
+    // Микрофон один на всю вкладку. Потребители (проверка в настройках и
+    // голосовой чат) берут его по ссылке и возвращают, когда закончат.
     this.mic = {
       active: false,
       requesting: false,
+      requestPromise: null,
       stream: null,
       source: null,
       analyser: null,
       data: null,
       level: 0,
       db: -Infinity,
+      refs: new Set(),
+      permission: 'unknown',
+      error: null,
     };
 
     this._onVisibility = this._onVisibility.bind(this);
     document.addEventListener('visibilitychange', this._onVisibility);
-    window.addEventListener('pagehide', () => this.disableMic());
+    window.addEventListener('pagehide', () => this.hardStopMic());
   }
 
   get ready() {
@@ -548,74 +596,100 @@ class AudioManager {
     this._blip({ frequency: 180, endFrequency: 120, duration: 0.19, type: 'sawtooth', gainValue: 0.016 });
   }
 
-  async enableMic() {
-    this.init();
-    if (this.mic.active) return { ok: true };
-    if (this.mic.requesting) return { ok: false, error: 'MIC_REQUEST_IN_PROGRESS' };
+  /** Запрашивает поток микрофона и возвращает его. Общий для всех систем. */
+  async _openMic() {
+    if (this.mic.stream) return this.mic.stream;
+    if (this.mic.requestPromise) return this.mic.requestPromise;
+
     if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
       const error = new Error('MEDIA_UNSUPPORTED');
       error.code = 'MEDIA_UNSUPPORTED';
+      this.mic.permission = 'unsupported';
+      this.mic.error = error;
       throw error;
     }
 
     this.mic.requesting = true;
-    let stream = null;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
-      });
+    this.mic.requestPromise = (async () => {
+      this.init();
+      let stream = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+          },
+          video: false,
+        });
 
-      if (!this.ctx) this.init();
-      if (!this.ctx) {
-        const error = new Error('AUDIO_CONTEXT_UNAVAILABLE');
-        error.code = 'AUDIO_CONTEXT_UNAVAILABLE';
+        if (!this.ctx) {
+          const error = new Error('AUDIO_CONTEXT_UNAVAILABLE');
+          error.code = 'AUDIO_CONTEXT_UNAVAILABLE';
+          throw error;
+        }
+        await this.ctx.resume().catch(() => {});
+
+        const source = this.ctx.createMediaStreamSource(stream);
+        const analyser = this.ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        analyser.smoothingTimeConstant = 0.35;
+        source.connect(analyser);
+
+        this.mic.stream = stream;
+        this.mic.source = source;
+        this.mic.analyser = analyser;
+        this.mic.data = new Uint8Array(analyser.fftSize);
+        this.mic.active = true;
+        this.mic.level = 0;
+        this.mic.db = -Infinity;
+        this.mic.permission = 'granted';
+        this.mic.error = null;
+
+        stream.getAudioTracks().forEach((track) => {
+          track.addEventListener('ended', () => {
+            if (this.mic.stream === stream) this._handleMicEnded();
+          });
+        });
+
+        return stream;
+      } catch (error) {
+        if (stream) stream.getTracks().forEach((track) => track.stop());
+        this.mic.active = false;
+        this.mic.error = error;
+        const name = error && (error.name || error.code);
+        this.mic.permission = name === 'NotAllowedError' || name === 'SecurityError'
+          ? 'denied'
+          : 'unavailable';
         throw error;
+      } finally {
+        this.mic.requesting = false;
+        this.mic.requestPromise = null;
       }
-      await this.ctx.resume().catch(() => {});
+    })();
 
-      const source = this.ctx.createMediaStreamSource(stream);
-      const analyser = this.ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      analyser.smoothingTimeConstant = 0.35;
-      source.connect(analyser);
+    return this.mic.requestPromise;
+  }
 
-      this.mic.stream = stream;
-      this.mic.source = source;
-      this.mic.analyser = analyser;
-      this.mic.data = new Uint8Array(analyser.fftSize);
-      this.mic.active = true;
-      this.mic.level = 0;
-      this.mic.db = -Infinity;
-
-      stream.getAudioTracks().forEach((track) => {
-        track.addEventListener('ended', () => this.disableMic());
-      });
-
-      return { ok: true };
+  async acquireMic(reason) {
+    this.mic.refs.add(reason);
+    try {
+      const stream = await this._openMic();
+      return { ok: true, stream };
     } catch (error) {
-      if (stream) stream.getTracks().forEach((track) => track.stop());
-      this.mic.active = false;
+      this.mic.refs.delete(reason);
       throw error;
-    } finally {
-      this.mic.requesting = false;
     }
   }
 
-  disableMic() {
-    if (this.mic.stream) {
-      this.mic.stream.getTracks().forEach((track) => {
-        try {
-          track.stop();
-        } catch (error) {
-          /* ignore */
-        }
-      });
-    }
+  releaseMic(reason) {
+    this.mic.refs.delete(reason);
+    if (this.mic.refs.size === 0) this.closeMic();
+  }
+
+  /** Полная остановка захвата. Вызывается, когда микрофон больше никому не нужен. */
+  closeMic() {
     if (this.mic.source) {
       try {
         this.mic.source.disconnect();
@@ -630,6 +704,15 @@ class AudioManager {
         /* ignore */
       }
     }
+    if (this.mic.stream) {
+      this.mic.stream.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch (error) {
+          /* ignore */
+        }
+      });
+    }
     this.mic.active = false;
     this.mic.requesting = false;
     this.mic.stream = null;
@@ -638,6 +721,31 @@ class AudioManager {
     this.mic.data = null;
     this.mic.level = 0;
     this.mic.db = -Infinity;
+  }
+
+  hardStopMic() {
+    this.mic.refs.clear();
+    this.closeMic();
+  }
+
+  _handleMicEnded() {
+    const refs = Array.from(this.mic.refs);
+    this.closeMic();
+    if (typeof this.onMicLost === 'function') this.onMicLost(refs);
+  }
+
+  /** Совместимость с Частью I: проверка микрофона в настройках. */
+  async enableMic() {
+    await this.acquireMic('settings');
+    return { ok: true };
+  }
+
+  disableMic() {
+    this.releaseMic('settings');
+  }
+
+  get micActive() {
+    return this.mic.active;
   }
 
   /** Возвращает сглаженный уровень 0..1 и уровень в дБ. Не пишет микрофон в выход. */
@@ -3375,94 +3483,2170 @@ class PlayerController {
 }
 
 // =============================================================================
-// СЕТЬ (ЗАГЛУШКА ДЛЯ ЧАСТИ II)
+// СЕТЬ — PeerJS
 // =============================================================================
+
+const PEER_SIGNALING = () => {
+  const override = typeof window !== 'undefined' ? window.__MX_PEER_SIGNALING__ : null;
+  return { ...CONFIG.network.signaling, ...(override || {}) };
+};
 
 class NetworkManager {
   constructor(bus) {
     this.bus = bus;
+    this.peer = null;
     this.session = null;
     this.connected = false;
-    this._tickAccumulator = 0;
+
+    this.roster = new Map();        // id -> { id, name, host, slot, ping, joinedAt }
+    this.connections = new Map();   // host: clientId -> DataConnection
+    this.remoteStates = new Map();  // id -> { s, at }
+    this._hostConn = null;
+    this._hostId = null;
+
+    this._status = 'idle';
     this._localStateProvider = null;
+    this._nameProvider = null;
+    this._voice = null;
+
+    this._tickAccumulator = 0;
+    this._lastSeen = new Map();
+    this._hostLastSeen = 0;
+    this._rtt = null;
+
+    this._pendingJoin = null;
+    this._joinTimer = 0;
+    this._reconnectTimer = 0;
+    this._destroyTimer = 0;
+    this._heartbeatTimer = 0;
+    this._sessionFailed = false;
+    this._destroying = false;
+
     this._codeAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+    this._onOnline = () => {
+      if (this.peer && this.peer.disconnected && !this._destroying) {
+        try {
+          this.peer.reconnect();
+        } catch (error) {
+          /* ignore */
+        }
+      }
+    };
+    window.addEventListener('online', this._onOnline);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) this._onOnline();
+    });
   }
+
+  // ---------------------------------------------------------------------------
+  // Служебное
+  // ---------------------------------------------------------------------------
 
   get isHost() {
     return Boolean(this.session && this.session.host);
   }
 
-  _generateCode() {
-    let code = '';
-    for (let i = 0; i < CONFIG.network.lobbyCodeLength; i += 1) {
-      code += this._codeAlphabet[Math.floor(Math.random() * this._codeAlphabet.length)];
-    }
-    return code;
+  get isActive() {
+    return Boolean(this.session && this.peer && !this.peer.destroyed);
   }
 
-  /**
-   * Часть I: лобби локальное. Часть II: здесь появится создание комнаты
-   * (WebSocket / WebRTC / GitHub-friendly сервис) и код приглашения.
-   */
-  createLobby() {
-    const code = this._generateCode();
-    this.session = {
-      code,
-      host: true,
-      mode: 'local',
-      createdAt: Date.now(),
-      peers: [],
-    };
-    this.connected = false;
-    this.bus.emit('network:lobbyCreated', this.session);
-    return this.session;
+  get selfId() {
+    return this.peer && !this.peer.destroyed ? this.peer.id : null;
   }
 
-  sanitizeCode(raw) {
-    return String(raw || '')
-      .toUpperCase()
-      .replace(/[^A-Z0-9]/g, '')
-      .replace(/^06/, '')
-      .slice(0, 6);
+  get status() {
+    return this._status;
   }
 
-  /**
-   * Часть II: подключение к существующему лобби.
-   * Возвращает единый формат результата, чтобы UI не зависел от транспорта.
-   */
-  async joinLobby(code) {
-    const clean = this.sanitizeCode(code);
-    await new Promise((resolve) => window.setTimeout(resolve, 550));
-    this.bus.emit('network:joinFailed', { code: clean, reason: 'not-implemented' });
-    return {
-      ok: false,
-      reason: 'not-implemented',
-      message: 'СЕТЕВОЙ МОДУЛЬ БУДЕТ УСТАНОВЛЕН В ЧАСТИ II',
-    };
+  get rtt() {
+    return this._rtt;
   }
 
-  leave() {
-    if (this.session) this.bus.emit('network:left', this.session);
-    this.session = null;
-    this.connected = false;
-    this._tickAccumulator = 0;
+  setVoiceChat(voice) {
+    this._voice = voice;
   }
 
-  /** [PART II] Функция, возвращающая локальное состояние игрока для рассылки. */
+  setNameProvider(provider) {
+    this._nameProvider = provider;
+  }
+
   setLocalStateProvider(provider) {
     this._localStateProvider = provider;
   }
 
-  update(dt) {
-    if (!this.session) return;
-    this._tickAccumulator += dt;
-    const interval = 1 / CONFIG.network.tickRate;
-    if (this._tickAccumulator < interval) return;
-    this._tickAccumulator = 0;
+  _displayName() {
+    let name = '';
+    try {
+      name = this._nameProvider ? this._nameProvider() : '';
+    } catch (error) {
+      name = '';
+    }
+    return this._sanitizeName(name);
+  }
 
-    // [PART II] Здесь локальный пакет будет уходить на сервер.
+  _sanitizeName(raw) {
+    const cleaned = String(raw || '')
+      .toUpperCase()
+      .replace(/[<>{}[\]\\/|`~^]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 14);
+    return cleaned;
+  }
+
+  _setStatus(status, detail = null) {
+    this._status = status;
+    this.bus.emit('network:status', { status, detail });
+  }
+
+  _emitRoster() {
+    const players = this._rosterArray();
+    if (this.session) this.session.peers = players;
+    this.bus.emit('network:roster', {
+      players,
+      selfId: this.selfId,
+      hostId: this._hostId || (this.isHost ? this.selfId : null),
+      maxPlayers: CONFIG.network.maxPlayers,
+      isHost: this.isHost,
+    });
+  }
+
+  _rosterArray() {
+    return Array.from(this.roster.values()).sort((a, b) => a.slot - b.slot);
+  }
+
+  _generateCode() {
+    const cryptoApi = window.crypto || window.msCrypto;
+    let code = '';
+    if (cryptoApi && typeof cryptoApi.getRandomValues === 'function') {
+      const values = new Uint32Array(CONFIG.network.lobbyCodeLength);
+      cryptoApi.getRandomValues(values);
+      for (const value of values) {
+        code += this._codeAlphabet[value % this._codeAlphabet.length];
+      }
+    } else {
+      for (let i = 0; i < CONFIG.network.lobbyCodeLength; i += 1) {
+        code += this._codeAlphabet[Math.floor(Math.random() * this._codeAlphabet.length)];
+      }
+    }
+    return code;
+  }
+
+  _fullPeerId(code) {
+    return `${CONFIG.network.prefix}${code}`;
+  }
+
+  sanitizeCode(raw) {
+    let clean = String(raw || '')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '');
+    // Полный peer id (nv06-XXXXX) тоже принимаем: его видно в отладке.
+    if (clean.startsWith('NV06') && clean.length > CONFIG.network.lobbyCodeLength) {
+      clean = clean.slice(4);
+    }
+    return clean.slice(0, CONFIG.network.lobbyCodeLength);
+  }
+
+  _nextSlot() {
+    const used = new Set(Array.from(this.roster.values()).map((player) => player.slot));
+    for (let slot = 1; slot <= CONFIG.network.maxPlayers; slot += 1) {
+      if (!used.has(slot)) return slot;
+    }
+    return CONFIG.network.maxPlayers;
+  }
+
+  _nextGuestName() {
+    const names = new Set(Array.from(this.roster.values()).map((player) => player.name));
+    for (let index = 1; index <= CONFIG.network.maxPlayers; index += 1) {
+      const name = `ПАССАЖИР ${index}`;
+      if (!names.has(name)) return name;
+    }
+    return 'ПАССАЖИР';
+  }
+
+  _peerOptions() {
+    const signaling = PEER_SIGNALING();
+    return {
+      debug: 0,
+      host: signaling.host,
+      port: signaling.port,
+      secure: Boolean(signaling.secure),
+      path: signaling.path || '/',
+      key: signaling.key || 'peerjs',
+      pingInterval: 5000,
+      config: {
+        iceServers: CONFIG.network.iceServers,
+        sdpSemantics: 'unified-plan',
+        iceCandidatePoolSize: 4,
+      },
+    };
+  }
+
+  _newPeer(id) {
+    if (typeof window.Peer !== 'function') {
+      const error = new Error('PEER_LIB_UNAVAILABLE');
+      error.type = 'peer-lib';
+      throw error;
+    }
+    return id ? new window.Peer(id, this._peerOptions()) : new window.Peer(this._peerOptions());
+  }
+
+  _waitForPeerOpen(peer, timeout = 15000) {
+    return new Promise((resolve, reject) => {
+      if (peer.destroyed) {
+        reject(Object.assign(new Error('PEER_DESTROYED'), { type: 'destroyed' }));
+        return;
+      }
+      if (peer.open) {
+        resolve(peer);
+        return;
+      }
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        peer.off('open', onOpen);
+        peer.off('error', onError);
+        peer.off('close', onClose);
+        fn(value);
+      };
+      const onOpen = () => finish(resolve, peer);
+      const onError = (error) => finish(reject, error);
+      const onClose = () => finish(reject, Object.assign(new Error('PEER_CLOSED'), { type: 'closed' }));
+      const timer = window.setTimeout(() => {
+        finish(reject, Object.assign(new Error('PEER_TIMEOUT'), { type: 'timeout' }));
+      }, timeout);
+      peer.on('open', onOpen);
+      peer.on('error', onError);
+      peer.on('close', onClose);
+    });
+  }
+
+  _attachCommon(peer) {
+    peer.on('error', (error) => this._onPeerError(error));
+    peer.on('disconnected', () => {
+      if (this._destroying || !this.session) return;
+      this._setStatus('reconnecting', 'СИГНАЛЬНЫЙ СЕРВЕР НЕДОСТУПЕН');
+      this._scheduleReconnect();
+    });
+    peer.on('call', (call) => {
+      if (this._voice) this._voice.acceptIncomingCall(call);
+      else {
+        try {
+          call.close();
+        } catch (error) {
+          /* ignore */
+        }
+      }
+    });
+    peer.on('close', () => {
+      if (this._destroying || !this.session) return;
+      this._failSession('network');
+    });
+  }
+
+  /**
+   * Пульс живёт на setInterval, а не на requestAnimationFrame: в фоновой
+   * вкладке кадры замирают, и без этого хост выкидывал бы игрока через 9 с.
+   */
+  _startHeartbeat() {
+    window.clearInterval(this._heartbeatTimer);
+    this._heartbeatTimer = window.setInterval(
+      () => this._heartbeat(),
+      Math.max(400, CONFIG.network.heartbeatInterval * 1000),
+    );
+  }
+
+  _stopHeartbeat() {
+    window.clearInterval(this._heartbeatTimer);
+    this._heartbeatTimer = 0;
+  }
+
+  _heartbeat() {
+    if (!this.session || !this.peer || this.peer.destroyed) return;
+    const now = performance.now();
+    const timeout = CONFIG.network.peerTimeout * 1000;
+
+    // Пульс дублирует и координаты: даже если кадры вкладки замерли,
+    // собеседники видят, что игрок на месте и жив.
     const local = this._localStateProvider ? this._localStateProvider() : null;
-    this.bus.emit('network:tick', { session: this.session, local });
+
+    if (this.isHost) {
+      for (const [id, conn] of Array.from(this.connections.entries())) {
+        const seen = this._lastSeen.get(id) || 0;
+        if (now - seen > timeout) {
+          this._dropConnection(id, 'timeout');
+          continue;
+        }
+        if (local) this._send(conn, { t: 'state', id: this.peer.id, s: local });
+        this._send(conn, { t: 'ping', ts: now });
+      }
+    } else if (this._hostConn) {
+      if (now - this._hostLastSeen > timeout) {
+        this._failSession('timeout');
+        return;
+      }
+      if (local) this._send(this._hostConn, { t: 'state', s: local });
+      this._send(this._hostConn, { t: 'ping', ts: now });
+    }
+  }
+
+  _scheduleReconnect() {
+    window.clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = window.setTimeout(() => {
+      if (!this.peer || this._destroying || !this.session) return;
+      if (!this.peer.disconnected || this.peer.destroyed) return;
+      try {
+        this.peer.reconnect();
+      } catch (error) {
+        this._scheduleReconnect();
+      }
+    }, CONFIG.network.reconnectDelay);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Создание лобби
+  // ---------------------------------------------------------------------------
+
+  async hostLobby(options = {}) {
+    this.leave({ silent: true });
+    this._destroying = false;
+    this._sessionFailed = false;
+
+    this.session = {
+      code: null,
+      host: true,
+      mode: 'online',
+      createdAt: Date.now(),
+      maxPlayers: CONFIG.network.maxPlayers,
+      peers: [],
+    };
+    this._setStatus('signaling');
+    this.bus.emit('network:session', this.session);
+
+    let lastError = null;
+    const attempts = 5;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const code = attempt === 0 && options.code ? this.sanitizeCode(options.code) : this._generateCode();
+      let peer = null;
+
+      try {
+        peer = this._newPeer(this._fullPeerId(code));
+        await this._waitForPeerOpen(peer);
+
+        if (!this.session) {
+          try {
+            peer.destroy();
+          } catch (error) {
+            /* ignore */
+          }
+          return { ok: false, reason: 'cancelled', message: 'СЕАНС ОТМЕНЁН.' };
+        }
+
+        this.peer = peer;
+        this._hostId = peer.id;
+        this.session.code = code;
+
+        const hostName = this._displayName() || 'ПАССАЖИР 1';
+        this.roster.clear();
+        this.roster.set(peer.id, {
+          id: peer.id,
+          name: hostName,
+          host: true,
+          slot: 1,
+          ping: 0,
+          joinedAt: Date.now(),
+        });
+
+        this._attachCommon(peer);
+        peer.on('connection', (conn) => this._acceptConnection(conn));
+
+        this.connected = true;
+        this._startHeartbeat();
+        this._setStatus('hosting');
+        this.bus.emit('network:lobbyReady', { session: this.session, code });
+        this._emitRoster();
+        return { ok: true, session: this.session, code };
+      } catch (error) {
+        lastError = error;
+        if (peer) {
+          try {
+            peer.destroy();
+          } catch (destroyError) {
+            /* ignore */
+          }
+        }
+        const unavailable = error && (error.type === 'unavailable-id' || error.type === 'invalid-id');
+        if (!unavailable) break;
+      }
+    }
+
+    this.session = null;
+    this.connected = false;
+    this._setStatus('error');
+    const mapped = this._mapError(lastError, 'host');
+    this.bus.emit('network:error', mapped);
+    return { ok: false, reason: mapped.reason, message: mapped.message };
+  }
+
+  _acceptConnection(conn) {
+    if (!this.isHost || !this.session) {
+      try {
+        conn.close();
+      } catch (error) {
+        /* ignore */
+      }
+      return;
+    }
+
+    const id = conn.peer;
+    const existing = this.connections.get(id);
+    if (existing && existing !== conn) {
+      try {
+        existing.close();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+
+    const handleOpen = () => {
+      conn.off('open', handleOpen);
+
+      if (this.connections.size >= CONFIG.network.maxPlayers - 1) {
+        try {
+          conn.send({ t: 'reject', reason: 'full', message: 'ВАГОН ЗАПОЛНЕН: 6 ПАССАЖИРОВ.' });
+        } catch (error) {
+          /* ignore */
+        }
+        window.setTimeout(() => {
+          try {
+            conn.close();
+          } catch (error) {
+            /* ignore */
+          }
+        }, 260);
+        return;
+      }
+
+      const metadata = conn.metadata || {};
+      let name = this._sanitizeName(metadata.name);
+      if (!name) name = this._nextGuestName();
+      if (Array.from(this.roster.values()).some((player) => player.name === name && player.id !== id)) {
+        name = `${name.slice(0, 11)} ${this._nextSlot()}`;
+      }
+
+      const player = {
+        id,
+        name,
+        host: false,
+        slot: this._nextSlot(),
+        ping: null,
+        joinedAt: Date.now(),
+      };
+
+      this.connections.set(id, conn);
+      this.roster.set(id, player);
+      this._lastSeen.set(id, performance.now());
+      this._setupConnection(conn);
+
+      this._send(conn, {
+        t: 'welcome',
+        v: CONFIG.version,
+        code: this.session.code,
+        selfId: id,
+        hostId: this.peer.id,
+        players: this._rosterArray(),
+        maxPlayers: CONFIG.network.maxPlayers,
+      });
+
+      this._broadcastRoster();
+      this._emitRoster();
+      this.bus.emit('network:peerJoined', player);
+    };
+
+    conn.on('open', handleOpen);
+    conn.on('error', () => this._dropConnection(id, 'error'));
+    if (conn.open) handleOpen();
+  }
+
+  _setupConnection(conn) {
+    conn.on('data', (data) => this._onData(conn, data));
+    conn.on('close', () => this._dropConnection(conn.peer, 'close'));
+    conn.on('error', () => this._dropConnection(conn.peer, 'error'));
+  }
+
+  _send(conn, payload) {
+    if (!conn || !conn.open) return false;
+    try {
+      conn.send(payload);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  _broadcast(payload, exceptId = null) {
+    for (const [id, conn] of this.connections) {
+      if (id === exceptId) continue;
+      this._send(conn, payload);
+    }
+  }
+
+  _broadcastRoster() {
+    if (!this.isHost) return;
+    this._broadcast({ t: 'roster', players: this._rosterArray(), hostId: this.peer.id });
+  }
+
+  _onData(conn, data) {
+    if (!data || typeof data !== 'object' || typeof data.t !== 'string') return;
+    const fromId = conn.peer;
+    this._lastSeen.set(fromId, performance.now());
+    if (!this.isHost) this._hostLastSeen = performance.now();
+
+    if (this.isHost) this._onHostData(conn, data, fromId);
+    else this._onClientData(conn, data, fromId);
+  }
+
+  _onHostData(conn, data, fromId) {
+    switch (data.t) {
+      case 'state': {
+        if (!data.s || typeof data.s !== 'object') return;
+        this.remoteStates.set(fromId, { s: data.s, at: performance.now() });
+        this._broadcast({ t: 'state', id: fromId, s: data.s }, fromId);
+        break;
+      }
+      case 'ping': {
+        this._send(conn, { t: 'pong', ts: data.ts });
+        break;
+      }
+      case 'pong': {
+        this._updateRtt(performance.now() - data.ts, fromId);
+        break;
+      }
+      case 'hello': {
+        // Клиент может уточнить позывной после подключения.
+        const player = this.roster.get(fromId);
+        const name = this._sanitizeName(data.name);
+        if (player && name && name !== player.name) {
+          player.name = name;
+          this._broadcastRoster();
+          this._emitRoster();
+        }
+        break;
+      }
+      case 'bye': {
+        this._send(conn, { t: 'ack' });
+        this._dropConnection(fromId, 'bye');
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  _onClientData(conn, data, fromId) {
+    switch (data.t) {
+      case 'welcome': {
+        if (this._pendingJoin) this._pendingJoin.resolve(data);
+        break;
+      }
+      case 'roster': {
+        if (Array.isArray(data.players)) {
+          this.roster.clear();
+          for (const player of data.players) {
+            if (!player || !player.id) continue;
+            this.roster.set(player.id, player);
+          }
+          if (data.hostId) this._hostId = data.hostId;
+          this._emitRoster();
+        }
+        break;
+      }
+      case 'state': {
+        if (!data.id || !data.s) return;
+        this.remoteStates.set(data.id, { s: data.s, at: performance.now() });
+        break;
+      }
+      case 'ping': {
+        this._send(conn, { t: 'pong', ts: data.ts });
+        break;
+      }
+      case 'pong': {
+        this._updateRtt(performance.now() - data.ts, this._hostId);
+        break;
+      }
+      case 'reject': {
+        if (this._pendingJoin) {
+          this._pendingJoin.reject({
+            type: 'reject',
+            reason: data.reason || 'rejected',
+            message: data.message || 'ХОСТ ОТКЛОНИЛ ПОДКЛЮЧЕНИЕ.',
+          });
+        }
+        break;
+      }
+      case 'close': {
+        this._failSession(data.reason || 'host-left');
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  _updateRtt(rtt, peerId) {
+    if (!Number.isFinite(rtt)) return;
+    this._rtt = Math.round(rtt);
+    if (this.isHost && peerId) {
+      const player = this.roster.get(peerId);
+      if (player) player.ping = this._rtt;
+    }
+    this.bus.emit('network:latency', { rtt: this._rtt, id: peerId || null });
+  }
+
+  _dropConnection(id, reason) {
+    const conn = this.connections.get(id);
+    if (conn) {
+      try {
+        conn.close();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    this.connections.delete(id);
+    this._lastSeen.delete(id);
+    const player = this.roster.get(id);
+    if (player) {
+      this.roster.delete(id);
+      this.remoteStates.delete(id);
+      if (this._voice) this._voice.removePeer(id);
+      if (this.isHost) {
+        this._broadcastRoster();
+        this._emitRoster();
+        this.bus.emit('network:peerLeft', { player, reason });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Подключение к лобби
+  // ---------------------------------------------------------------------------
+
+  async joinLobby(code) {
+    const clean = this.sanitizeCode(code);
+    const length = CONFIG.network.lobbyCodeLength;
+
+    if (clean.length !== length) {
+      return {
+        ok: false,
+        reason: 'invalid-code',
+        message: `КОД ЛОББИ СОСТОИТ ИЗ ${length} СИМВОЛОВ.`,
+      };
+    }
+
+    this.leave({ silent: true });
+    this._destroying = false;
+    this._sessionFailed = false;
+
+    this.session = {
+      code: clean,
+      host: false,
+      mode: 'online',
+      createdAt: Date.now(),
+      maxPlayers: CONFIG.network.maxPlayers,
+      peers: [],
+    };
+    this._setStatus('signaling');
+    this.bus.emit('network:session', this.session);
+
+    let peer = null;
+    try {
+      peer = this._newPeer();
+      await this._waitForPeerOpen(peer);
+      this.peer = peer;
+      this._attachCommon(peer);
+
+      const conn = peer.connect(this._fullPeerId(clean), {
+        reliable: true,
+        metadata: { name: this._displayName() },
+      });
+      this._hostConn = conn;
+
+      const welcome = await this._awaitWelcome(conn);
+      this._hostId = welcome.hostId || conn.peer;
+      this.roster.clear();
+      if (Array.isArray(welcome.players)) {
+        for (const player of welcome.players) {
+          if (player && player.id) this.roster.set(player.id, player);
+        }
+      }
+      if (!this.roster.has(peer.id)) {
+        this.roster.set(peer.id, {
+          id: peer.id,
+          name: this._displayName() || 'ПАССАЖИР',
+          host: false,
+          slot: this.roster.size + 1,
+          ping: null,
+          joinedAt: Date.now(),
+        });
+      }
+
+      this.session.code = welcome.code || clean;
+      this.connected = true;
+      this._hostLastSeen = performance.now();
+      this._startHeartbeat();
+      this._setStatus('connected');
+      this._emitRoster();
+      this.bus.emit('network:joined', { session: this.session, code: this.session.code });
+
+      return { ok: true, session: this.session, code: this.session.code };
+    } catch (error) {
+      if (peer) {
+        try {
+          peer.destroy();
+        } catch (destroyError) {
+          /* ignore */
+        }
+      }
+      this.peer = null;
+      this._hostConn = null;
+      this.session = null;
+      this.connected = false;
+      this._setStatus('error');
+      const mapped = this._mapError(error, 'join');
+      this.bus.emit('network:error', mapped);
+      return { ok: false, reason: mapped.reason, message: mapped.message };
+    }
+  }
+
+  _awaitWelcome(conn) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(this._joinTimer);
+        conn.off('open', onOpen);
+        conn.off('close', onClose);
+        conn.off('error', onError);
+        conn.off('data', onData);
+        this._pendingJoin = null;
+        fn(value);
+      };
+
+      const onOpen = () => {
+        this._send(conn, { t: 'hello', name: this._displayName() });
+      };
+      const onClose = () => finish(reject, { type: 'closed', reason: 'host-unreachable' });
+      const onError = (error) => finish(reject, error);
+      const onData = (data) => {
+        if (!data || typeof data !== 'object') return;
+        if (data.t === 'welcome') {
+          this._setupConnection(conn);
+          finish(resolve, data);
+        } else if (data.t === 'reject') {
+          finish(reject, {
+            type: 'reject',
+            reason: data.reason || 'rejected',
+            message: data.message || 'ХОСТ ОТКЛОНИЛ ПОДКЛЮЧЕНИЕ.',
+          });
+        }
+      };
+
+      this._pendingJoin = { resolve, reject };
+
+      conn.on('open', onOpen);
+      conn.on('close', onClose);
+      conn.on('error', onError);
+      conn.on('data', onData);
+
+      if (conn.open) onOpen();
+
+      this._joinTimer = window.setTimeout(() => {
+        finish(reject, {
+          type: 'timeout',
+          reason: 'timeout',
+          message: 'ХОСТ НЕ ОТВЕЧАЕТ. ПРОВЕРЬТЕ КОД И ПОВТОРИТЕ ПОПЫТКУ.',
+        });
+      }, CONFIG.network.joinTimeout);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ошибки и завершение
+  // ---------------------------------------------------------------------------
+
+  _onPeerError(error) {
+    const type = error && error.type;
+    if (type === 'peer-unavailable') {
+      if (this._pendingJoin) {
+        this._pendingJoin.reject({
+          type: 'peer-unavailable',
+          reason: 'not-found',
+          message: 'ЛОББИ С ТАКИМ КОДОМ НЕ НАЙДЕНО.',
+        });
+      }
+      return;
+    }
+    if (type === 'unavailable-id' || type === 'invalid-id') {
+      // Обрабатывается в hostLobby (повторная генерация кода).
+      return;
+    }
+    if (type === 'network' || type === 'server-error' || type === 'socket-error') {
+      if (this.session) this._setStatus('reconnecting', 'ПОТЕРЯ СВЯЗИ С СИГНАЛЬНЫМ СЕРВЕРОМ');
+      this._scheduleReconnect();
+      return;
+    }
+    if (type === 'webrtc' || type === 'webrtc-error') {
+      this.bus.emit('network:warning', {
+        reason: 'webrtc',
+        message: 'НЕ УДАЛОСЬ УСТАНОВИТЬ ПРЯМОЕ СОЕДИНЕНИЕ. ВОЗМОЖЕН СТРОГИЙ NAT — НУЖЕН TURN-СЕРВЕР.',
+      });
+    }
+  }
+
+  _mapError(error, mode) {
+    const type = (error && (error.type || error.reason)) || 'unknown';
+    if (type === 'peer-lib') {
+      return {
+        reason: 'peer-lib',
+        message: 'НЕ УДАЛОСЬ ЗАГРУЗИТЬ СЕТЕВОЙ МОДУЛЬ PEERJS. ПРОВЕРЬТЕ СОЕДИНЕНИЕ И ПЕРЕЗАГРУЗИТЕ.',
+      };
+    }
+    if (type === 'unavailable-id') {
+      return { reason: 'unavailable-id', message: 'КОД ЛОББИ УЖЕ ЗАНЯТ. ПОПРОБУЙТЕ ЕЩЁ РАЗ.' };
+    }
+    if (type === 'peer-unavailable' || type === 'not-found') {
+      return { reason: 'not-found', message: 'ЛОББИ С ТАКИМ КОДОМ НЕ НАЙДЕНО.' };
+    }
+    if (type === 'reject' || type === 'full') {
+      return { reason: 'full', message: 'ВАГОН ЗАПОЛНЕН: 6 ПАССАЖИРОВ.' };
+    }
+    if (type === 'timeout') {
+      return {
+        reason: 'timeout',
+        message: mode === 'host'
+          ? 'СИГНАЛЬНЫЙ СЕРВЕР НЕ ОТВЕТИЛ. ПРОВЕРЬТЕ СЕТЬ И ПОВТОРИТЕ.'
+          : 'ХОСТ НЕ ОТВЕЧАЕТ. ПРОВЕРЬТЕ КОД И ПОВТОРИТЕ ПОПЫТКУ.',
+      };
+    }
+    if (type === 'network' || type === 'server-error' || type === 'socket-error') {
+      return { reason: 'network', message: 'НЕТ СВЯЗИ С СИГНАЛЬНЫМ СЕРВЕРОМ. ПРОВЕРЬТЕ ИНТЕРНЕТ.' };
+    }
+    return { reason: 'unknown', message: 'НЕ УДАЛОСЬ УСТАНОВИТЬ СВЯЗЬ. ПОВТОРИТЕ ПОПЫТКУ.' };
+  }
+
+  _failSession(reason) {
+    if (this._sessionFailed || !this.session) return;
+    this._sessionFailed = true;
+    const session = this.session;
+    const wasHost = this.isHost;
+    this.leave({ silent: true });
+    this.bus.emit('network:hostLeft', { reason, session, wasHost });
+  }
+
+  leave({ silent = false } = {}) {
+    this._destroying = true;
+    window.clearTimeout(this._joinTimer);
+    window.clearTimeout(this._reconnectTimer);
+    this._stopHeartbeat();
+    this._pendingJoin = null;
+    this._sessionFailed = false;
+
+    const hadSession = Boolean(this.session);
+
+    if (this._voice) this._voice.leave();
+
+    if (this.isHost) {
+      for (const conn of this.connections.values()) {
+        this._send(conn, { t: 'close', reason: 'host-left' });
+      }
+    } else if (this._hostConn) {
+      this._send(this._hostConn, { t: 'bye' });
+    }
+
+    for (const conn of this.connections.values()) {
+      try {
+        conn.close();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    if (this._hostConn) {
+      try {
+        this._hostConn.close();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+
+    const peer = this.peer;
+    this.peer = null;
+    this._hostConn = null;
+    this.connections.clear();
+    this.roster.clear();
+    this.remoteStates.clear();
+    this._lastSeen.clear();
+    this.session = null;
+    this.connected = false;
+    this._hostId = null;
+    this._rtt = null;
+    this._tickAccumulator = 0;
+    this._status = 'idle';
+
+    if (peer) {
+      window.clearTimeout(this._destroyTimer);
+      this._destroyTimer = window.setTimeout(() => {
+        try {
+          peer.destroy();
+        } catch (error) {
+          /* ignore */
+        }
+      }, 140);
+    }
+
+    this._destroying = false;
+
+    if (hadSession && !silent) {
+      this.bus.emit('network:closed', { reason: 'left' });
+    }
+  }
+
+  /** Мягкий выход по кнопке «Покинуть лобби»: сначала уведомляем, потом рвём. */
+  async closeLobby() {
+    this.leave();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Тик
+  // ---------------------------------------------------------------------------
+
+  update(dt) {
+    if (!this.session || !this.peer || this.peer.destroyed) return;
+
+    this._tickAccumulator += dt;
+    if (this._tickAccumulator >= 1 / CONFIG.network.tickRate) {
+      this._tickAccumulator = 0;
+      const local = this._localStateProvider ? this._localStateProvider() : null;
+      if (local) {
+        if (this.isHost) {
+          const packet = { t: 'state', id: this.peer.id, s: local };
+          for (const conn of this.connections.values()) this._send(conn, packet);
+        } else if (this._hostConn) {
+          this._send(this._hostConn, { t: 'state', s: local });
+        }
+      }
+    }
+
+  }
+
+  /** Состояние удалённого игрока + признак «в вагоне». */
+  getRemoteState(id) {
+    return this.remoteStates.get(id) || null;
+  }
+
+  getPlayers() {
+    return this._rosterArray();
+  }
+}
+
+// =============================================================================
+// УДАЛЁННЫЕ ИГРОКИ
+// =============================================================================
+
+class RemotePlayers {
+  constructor({ scene, camera, bus, voice, world }) {
+    this.scene = scene;
+    this.camera = camera;
+    this.bus = bus;
+    this.voice = voice;
+    this.world = world;
+    this.avatars = new Map();
+    this.selfId = null;
+    this._tagTextures = new Map();
+    this._group = new THREE.Group();
+    this._group.name = 'Экипаж';
+    scene.add(this._group);
+
+    this._bodyGeometry = new THREE.CapsuleGeometry(0.27, 1.0, 5, 12);
+    this._headGeometry = new THREE.SphereGeometry(0.165, 14, 10);
+    this._shoulderGeometry = new THREE.BoxGeometry(0.62, 0.1, 0.3);
+    this._visorGeometry = new THREE.BoxGeometry(0.2, 0.032, 0.02);
+    this._ringGeometry = new THREE.RingGeometry(0.3, 0.37, 28);
+    this._tagGeometry = new THREE.PlaneGeometry(1.5, 0.42);
+  }
+
+  sync(roster) {
+    if (!roster) return;
+    this.selfId = roster.selfId;
+    const seen = new Set();
+
+    for (const player of roster.players) {
+      if (!player || player.id === this.selfId) continue;
+      seen.add(player.id);
+      let avatar = this.avatars.get(player.id);
+      if (!avatar) {
+        avatar = this._createAvatar(player);
+        this.avatars.set(player.id, avatar);
+      }
+      avatar.player = player;
+      if (avatar.name !== player.name) {
+        avatar.name = player.name;
+        this._setTag(avatar, player.name, false, false);
+      }
+    }
+
+    for (const [id, avatar] of Array.from(this.avatars.entries())) {
+      if (seen.has(id)) continue;
+      this._removeAvatar(avatar);
+      this.avatars.delete(id);
+    }
+  }
+
+  _createAvatar(player) {
+    const group = new THREE.Group();
+    group.name = `Пассажир: ${player.name}`;
+    group.visible = false;
+    this._group.add(group);
+
+    const bodyMaterial = new THREE.MeshStandardMaterial({
+      color: 0x3a4640,
+      roughness: 0.88,
+      metalness: 0.08,
+      emissive: 0x18251c,
+      emissiveIntensity: 0.85,
+    });
+    const body = new THREE.Mesh(this._bodyGeometry, bodyMaterial);
+    body.position.y = 0.79;
+    body.castShadow = false;
+    body.receiveShadow = false;
+    group.add(body);
+
+    const head = new THREE.Mesh(this._headGeometry, bodyMaterial);
+    head.position.y = 1.66;
+    group.add(head);
+
+    const shoulders = new THREE.Mesh(
+      this._shoulderGeometry,
+      new THREE.MeshStandardMaterial({ color: 0x232a25, roughness: 0.8, metalness: 0.2 }),
+    );
+    shoulders.position.y = 1.35;
+    group.add(shoulders);
+
+    // Светящаяся полоска визора — силуэт читается в темноте.
+    const visorMaterial = new THREE.MeshStandardMaterial({
+      color: 0x0a1410,
+      emissive: 0x9be3dc,
+      emissiveIntensity: 1.5,
+      roughness: 0.4,
+    });
+    const visor = new THREE.Mesh(this._visorGeometry, visorMaterial);
+    visor.position.set(0, 1.7, -0.15);
+    group.add(visor);
+
+    const ringMaterial = new THREE.MeshBasicMaterial({
+      color: 0x9be3dc,
+      transparent: true,
+      opacity: 0.22,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const ring = new THREE.Mesh(this._ringGeometry, ringMaterial);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.012;
+    group.add(ring);
+
+    const tagMaterial = new THREE.SpriteMaterial({
+      map: this._getTagTexture(player.name, false, false),
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
+      sizeAttenuation: true,
+      toneMapped: false,
+    });
+    const tag = new THREE.Sprite(tagMaterial);
+    tag.scale.set(1.5, 0.42, 1);
+    tag.position.y = 2.18;
+    group.add(tag);
+
+    const avatar = {
+      id: player.id,
+      player,
+      name: player.name,
+      group,
+      body,
+      bodyMaterial,
+      visor,
+      visorMaterial,
+      ring,
+      ringMaterial,
+      tag,
+      tagMaterial,
+      samples: [],
+      speaking: false,
+      stale: false,
+      inCar: false,
+      lastTagState: '',
+      hasState: false,
+    };
+
+    if (this.voice) this.voice.attachAvatar(player.id, group);
+    return avatar;
+  }
+
+  _removeAvatar(avatar) {
+    this._group.remove(avatar.group);
+    avatar.group.traverse((object) => {
+      if (object.geometry && object.geometry !== this._bodyGeometry
+        && object.geometry !== this._headGeometry
+        && object.geometry !== this._shoulderGeometry
+        && object.geometry !== this._visorGeometry
+        && object.geometry !== this._ringGeometry
+        && object.geometry !== this._tagGeometry) {
+        object.geometry.dispose();
+      }
+    });
+    avatar.tagMaterial.dispose();
+    const seen = new Set();
+    avatar.group.traverse((object) => {
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) {
+        if (!material || seen.has(material)) continue;
+        seen.add(material);
+        if (material !== avatar.tagMaterial) material.dispose();
+      }
+    });
+    if (this.voice) this.voice.removePeer(avatar.id);
+  }
+
+  _getTagTexture(name, speaking, stale) {
+    const key = `${name}|${speaking ? 1 : 0}|${stale ? 1 : 0}`;
+    if (this._tagTextures.has(key)) return this._tagTextures.get(key);
+
+    const width = 512;
+    const height = 144;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+
+    ctx.clearRect(0, 0, width, height);
+
+    // Подложка.
+    ctx.fillStyle = 'rgba(4, 8, 6, 0.8)';
+    ctx.fillRect(6, 14, width - 12, 116);
+    ctx.strokeStyle = stale ? 'rgba(255, 90, 78, 0.55)' : 'rgba(185, 247, 164, 0.42)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(6, 14, width - 12, 116);
+
+    // Уголки.
+    ctx.fillStyle = stale ? 'rgba(255, 90, 78, 0.9)' : 'rgba(185, 247, 164, 0.9)';
+    ctx.fillRect(6, 14, 3, 16);
+    ctx.fillRect(6, 14, 16, 3);
+    ctx.fillRect(width - 9, 14, 3, 16);
+    ctx.fillRect(width - 22, 14, 16, 3);
+
+    // Индикатор голоса.
+    ctx.beginPath();
+    ctx.arc(42, 72, 8, 0, Math.PI * 2);
+    ctx.fillStyle = stale
+      ? 'rgba(255, 90, 78, 0.9)'
+      : speaking
+        ? 'rgba(185, 247, 164, 1)'
+        : 'rgba(120, 150, 122, 0.5)';
+    ctx.fill();
+    if (speaking) {
+      ctx.strokeStyle = 'rgba(185, 247, 164, 0.45)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(42, 72, 15, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.font = '600 54px "Cascadia Mono", "Courier New", monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = stale ? 'rgba(255, 190, 184, 0.86)' : 'rgba(235, 244, 228, 0.95)';
+    const label = name.slice(0, 14);
+    ctx.fillText(label, 66, 70);
+
+    if (stale) {
+      ctx.font = '500 22px "Cascadia Mono", "Courier New", monospace';
+      ctx.fillStyle = 'rgba(255, 120, 105, 0.9)';
+      ctx.textAlign = 'right';
+      ctx.fillText('НЕТ СВЯЗИ', width - 20, 108);
+    } else if (speaking) {
+      // Мини-эквалайзер.
+      ctx.fillStyle = 'rgba(185, 247, 164, 0.85)';
+      for (let i = 0; i < 4; i += 1) {
+        const bar = 8 + ((i * 9) % 18);
+        ctx.fillRect(width - 34 - i * 15, 72 - bar / 2, 8, bar);
+      }
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.anisotropy = 4;
+    this._tagTextures.set(key, texture);
+
+    // Ограничиваем кэш, чтобы смена состояний не текла.
+    if (this._tagTextures.size > 80) {
+      const firstKey = this._tagTextures.keys().next().value;
+      const old = this._tagTextures.get(firstKey);
+      this._tagTextures.delete(firstKey);
+      old.dispose();
+    }
+    return texture;
+  }
+
+  _setTag(avatar, name, speaking, stale) {
+    const state = `${speaking ? 1 : 0}${stale ? 1 : 0}`;
+    if (avatar.lastTagState === state && avatar.name === name) return;
+    avatar.lastTagState = state;
+    avatar.name = name;
+    avatar.tagMaterial.map = this._getTagTexture(name, speaking, stale);
+    avatar.tagMaterial.needsUpdate = true;
+  }
+
+  _applyState(avatar, state, receiveTime) {
+    if (!state) return;
+    avatar.hasState = true;
+    avatar.inCar = state.c === 1 || state.c === true;
+    if (!avatar.inCar) {
+      avatar.group.visible = false;
+      if (this.voice) this.voice.setRemoteInCar(avatar.id, false);
+      return;
+    }
+
+    const sample = {
+      t: receiveTime,
+      x: Number(state.x) || 0,
+      y: Number(state.y) || 0,
+      z: Number(state.z) || 0,
+      yaw: Number(state.yaw) || 0,
+    };
+
+    const samples = avatar.samples;
+    const last = samples[samples.length - 1];
+    // Отбрасываем телепорт-скачки дальше 6 метров (переподключение, лаг).
+    if (last && Math.hypot(sample.x - last.x, sample.z - last.z) > 6) {
+      samples.length = 0;
+    }
+    samples.push(sample);
+    if (samples.length > 24) samples.shift();
+
+    avatar.group.visible = true;
+    if (this.voice) this.voice.setRemoteInCar(avatar.id, true);
+  }
+
+  update(dt, elapsed) {
+    if (!this.network) return;
+    const now = performance.now();
+    const delay = 110;
+
+    for (const avatar of this.avatars.values()) {
+      const entry = this.network.getRemoteState(avatar.id);
+      if (entry && (!avatar.lastAt || entry.at > avatar.lastAt)) {
+        avatar.lastAt = entry.at;
+        this._applyState(avatar, entry.s, entry.at);
+      }
+
+      if (!avatar.hasState || !avatar.inCar) continue;
+
+      const samples = avatar.samples;
+      if (samples.length === 0) continue;
+
+      const renderTime = now - delay;
+      let from = samples[0];
+      let to = samples[samples.length - 1];
+      for (let i = 0; i < samples.length - 1; i += 1) {
+        if (samples[i].t <= renderTime && samples[i + 1].t >= renderTime) {
+          from = samples[i];
+          to = samples[i + 1];
+          break;
+        }
+        if (samples[i + 1].t < renderTime) {
+          from = samples[i + 1];
+          to = samples[i + 1];
+        }
+      }
+
+      let x = to.x;
+      let y = to.y;
+      let z = to.z;
+      let yaw = to.yaw;
+      if (to !== from && to.t > from.t) {
+        const alpha = clamp((renderTime - from.t) / (to.t - from.t), 0, 1);
+        x = from.x + (to.x - from.x) * alpha;
+        y = from.y + (to.y - from.y) * alpha;
+        z = from.z + (to.z - from.z) * alpha;
+        let delta = to.yaw - from.yaw;
+        while (delta > Math.PI) delta -= Math.PI * 2;
+        while (delta < -Math.PI) delta += Math.PI * 2;
+        yaw = from.yaw + delta * alpha;
+      }
+
+      avatar.group.position.set(x, y, z);
+      avatar.group.rotation.y = yaw;
+
+      const newest = samples[samples.length - 1];
+      const stale = now - newest.t > 1200;
+      if (stale !== avatar.stale) {
+        avatar.stale = stale;
+        avatar.bodyMaterial.emissive.setHex(stale ? 0x2a0d0a : 0x18251c);
+        avatar.ringMaterial.color.setHex(stale ? 0xff5a4e : 0x9be3dc);
+      }
+
+      // Наблюдение за голосом.
+      const speaking = Boolean(this.voice && this.voice.isSpeaking(avatar.id));
+      if (speaking !== avatar.speaking) {
+        avatar.speaking = speaking;
+        avatar.visorMaterial.emissiveIntensity = speaking ? 2.6 : 1.5;
+        avatar.ringMaterial.opacity = speaking ? 0.5 : 0.22;
+      }
+      this._setTag(avatar, avatar.name, speaking, stale);
+
+      // Намётки исчезают в тумане и не мешают на расстоянии.
+      const distance = this.camera.position.distanceTo(avatar.group.position);
+      const visibleTag = distance < CONFIG.voice.nametagDistance;
+      avatar.tag.visible = visibleTag;
+      if (visibleTag) {
+        // Табличка держит мировой размер: читается и вблизи, и в глубине вагона.
+        avatar.tagMaterial.opacity = clamp((CONFIG.voice.nametagDistance - distance) / 5, 0.12, 1);
+      }
+
+      // Лёгкое «дыхание» капсулы.
+      avatar.body.position.y = 0.79 + (speaking ? Math.sin(elapsed * 6) * 0.006 : 0);
+    }
+  }
+
+  clear() {
+    for (const avatar of this.avatars.values()) this._removeAvatar(avatar);
+    this.avatars.clear();
+  }
+
+  setNetwork(network) {
+    this.network = network;
+  }
+}
+
+// =============================================================================
+// ГОЛОСОВОЙ ЧАТ (WebRTC + пространственное аудио)
+// =============================================================================
+
+class VoiceChat {
+  constructor({ audio, bus, scene, camera, store }) {
+    this.audio = audio;
+    this.bus = bus;
+    this.scene = scene;
+    this.camera = camera;
+    this.store = store;
+
+    this.network = null;
+    this.listener = null;
+    this.initialized = false;
+
+    this.enabled = this.store.values.voiceEnabled !== false;
+    this.mode = this.store.values.voiceMode === 'ptt' ? 'ptt' : 'open';
+    this.localInCar = false;
+    this.pttHeld = false;
+
+    this.localStream = null;
+    this.localAnalyser = null;
+    this.localSpeaking = false;
+    this.localLevel = 0;
+
+    this.peers = new Map();
+    this.silentStream = null;
+    this._silentNodes = null;
+    this._statusTimer = 0;
+    this._lastStatus = 0;
+    this._lastLocalLevel = 0;
+    this._retryTimers = new Map();
+    this._noiseBuffer = null;
+    this._pttBound = false;
+    this._lastRoster = null;
+    this._micRetryTimer = 0;
+
+    this._onKeyDown = this._onKeyDown.bind(this);
+    this._onKeyUp = this._onKeyUp.bind(this);
+    this._onBlur = this._onBlur.bind(this);
+
+    this.bus.emit('voice:status', this._statusPayload());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Инициализация
+  // ---------------------------------------------------------------------------
+
+  setNetwork(network) {
+    this.network = network;
+  }
+
+  init() {
+    if (this.initialized) return true;
+    this.audio.init();
+    if (!this.audio.ctx) return false;
+
+    // Один AudioContext на игру: и эмбиент, и пространственный голос.
+    THREE.AudioContext.setContext(this.audio.ctx);
+    this.listener = new THREE.AudioListener();
+    this.camera.add(this.listener);
+
+    this._ensureSceneCamera();
+    this._noiseBuffer = this._createNoiseBuffer();
+    this.initialized = true;
+
+    if (!this._pttBound) {
+      this._pttBound = true;
+      window.addEventListener('keydown', this._onKeyDown, { passive: true });
+      window.addEventListener('keyup', this._onKeyUp, { passive: true });
+      window.addEventListener('blur', this._onBlur);
+    }
+
+    this._emitStatus(true);
+    return true;
+  }
+
+  _ensureSceneCamera() {
+    if (this.camera.parent) return;
+    this.scene.add(this.camera);
+  }
+
+  _createNoiseBuffer() {
+    const ctx = this.listener ? this.listener.context : this.audio.ctx;
+    const length = Math.floor(ctx.sampleRate * 1.5);
+    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < length; i += 1) {
+      const white = Math.random() * 2 - 1;
+      last = last * 0.82 + white * 0.18;
+      data[i] = last * 0.7;
+    }
+    return buffer;
+  }
+
+  /** Запрос разрешения на старте (без удержания микрофона). */
+  async probePermission() {
+    if (this.audio.mic.permission === 'granted' && this.localStream) return true;
+    try {
+      await this.audio.acquireMic('probe');
+      this.audio.releaseMic('probe');
+      this._emitStatus(true);
+      return true;
+    } catch (error) {
+      this._emitStatus(true);
+      return false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Состояние / настройки
+  // ---------------------------------------------------------------------------
+
+  _statusPayload() {
+    return {
+      supported: Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+      enabled: this.enabled,
+      initialized: this.initialized,
+      active: Boolean(this.localStream),
+      mode: this.mode,
+      permission: this.audio.mic.permission,
+      speaking: this.localSpeaking,
+      level: this.localLevel,
+      peers: this.peers.size,
+      inCar: this.localInCar,
+    };
+  }
+
+  _emitStatus(force = false) {
+    const now = performance.now();
+    if (!force && now - this._lastStatus < 120) return;
+    this._lastStatus = now;
+    this.bus.emit('voice:status', this._statusPayload());
+  }
+
+  async setEnabled(enabled) {
+    this.enabled = Boolean(enabled);
+    this.store.save({ voiceEnabled: this.enabled });
+
+    if (!this.enabled) {
+      this._releaseLocal();
+      for (const id of Array.from(this.peers.keys())) this._closePeer(id);
+      this._emitStatus(true);
+      return;
+    }
+
+    if (this.network && this.network.selfId) await this._ensureLocal();
+    this._emitStatus(true);
+  }
+
+  setMode(mode) {
+    this.mode = mode === 'ptt' ? 'ptt' : 'open';
+    this.store.save({ voiceMode: this.mode });
+    this._applyTrackState();
+    this._emitStatus(true);
+  }
+
+  setLocalInCar(inCar) {
+    this.localInCar = Boolean(inCar);
+    this._emitStatus(true);
+  }
+
+  setRemoteInCar(id, inCar) {
+    const peer = this.peers.get(id);
+    if (!peer) return;
+    if (peer.inCar === inCar) return;
+    peer.inCar = Boolean(inCar);
+    this._emitStatus(true);
+  }
+
+  async _ensureLocal() {
+    if (!this.enabled) return null;
+    if (this.localStream) return this.localStream;
+    try {
+      const result = await this.audio.acquireMic('voice');
+      this.localStream = result.stream;
+      this._applyTrackState();
+      this._emitStatus(true);
+      return this.localStream;
+    } catch (error) {
+      console.warn('[Voice] Микрофон недоступен', error);
+      this.localStream = null;
+      this._emitStatus(true);
+      return null;
+    }
+  }
+
+  _releaseLocal() {
+    this.localStream = null;
+    if (this.localAnalyser) {
+      try {
+        this.localAnalyser.disconnect();
+      } catch (error) {
+        /* ignore */
+      }
+      this.localAnalyser = null;
+    }
+    this.audio.releaseMic('voice');
+    this.localSpeaking = false;
+    this.localLevel = 0;
+  }
+
+  _applyTrackState() {
+    if (!this.localStream) return;
+    const audible = this.enabled && (this.mode === 'open' || this.pttHeld);
+    this.localStream.getAudioTracks().forEach((track) => {
+      track.enabled = audible;
+    });
+  }
+
+  _getOutgoingStream() {
+    if (this.localStream) return this.localStream;
+    if (!this.silentStream) {
+      const ctx = this.listener ? this.listener.context : this.audio.ctx;
+      if (!ctx) return null;
+      const destination = ctx.createMediaStreamDestination();
+      const oscillator = ctx.createOscillator();
+      oscillator.type = 'sine';
+      oscillator.frequency.value = 60;
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      oscillator.connect(gain);
+      gain.connect(destination);
+      oscillator.start();
+      this.silentStream = destination.stream;
+      this._silentNodes = { oscillator, gain, destination };
+    }
+    return this.silentStream;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ростер и звонки
+  // ---------------------------------------------------------------------------
+
+  async syncRoster(roster) {
+    if (!roster || !this.network) return;
+    this._lastRoster = roster;
+    this.selfId = roster.selfId;
+    this.hostId = roster.hostId;
+
+    if (!this.enabled) {
+      this._emitStatus(true);
+      return;
+    }
+
+    if (!this.initialized) this.init();
+    await this._ensureLocal();
+
+    const ids = new Set();
+    for (const player of roster.players) {
+      if (!player || !player.id || player.id === roster.selfId) continue;
+      ids.add(player.id);
+      this._ensureCall(player.id);
+    }
+
+    for (const id of Array.from(this.peers.keys())) {
+      if (!ids.has(id)) this._closePeer(id);
+    }
+
+    this._emitStatus(true);
+  }
+
+  _ensureCall(remoteId) {
+    if (!this.enabled || !this.network || !this.network.peer) return;
+    const selfId = this.network.selfId;
+    if (!selfId || remoteId === selfId) return;
+
+    // Запись могла появиться раньше из attachAvatar(): её нельзя затирать,
+    // иначе позиционный объект потеряет привязку к капсуле.
+    let entry = this.peers.get(remoteId);
+    if (!entry) {
+      entry = this._emptyPeer();
+      this.peers.set(remoteId, entry);
+    }
+    if (entry.call) return;
+
+    // Инициатор — меньший peer id. Второй ждёт звонка, но через 6 секунд
+    // пробует сам: так голос появляется даже если инициатор «завис».
+    if (selfId > remoteId) {
+      if (this._retryTimers.has(remoteId)) return;
+      this._retryTimers.set(remoteId, window.setTimeout(() => {
+        this._retryTimers.delete(remoteId);
+        const current = this.peers.get(remoteId);
+        if (current && !current.call) this._initiateCall(remoteId);
+      }, 6000));
+      return;
+    }
+
+    this._initiateCall(remoteId);
+  }
+
+  _emptyPeer() {
+    return {
+      call: null,
+      outgoing: false,
+      stream: null,
+      source: null,
+      nodes: [],
+      analyser: null,
+      analyserData: null,
+      level: 0,
+      speaking: false,
+      audio: null,
+      gain: null,
+      object3D: null,
+      inCar: false,
+      flat: null,
+      staticNodes: [],
+      closed: false,
+      retried: false,
+    };
+  }
+
+  _initiateCall(remoteId) {
+    if (!this.enabled || !this.network || !this.network.peer) return;
+    if (remoteId === this.network.selfId) return;
+
+    let entry = this.peers.get(remoteId);
+    if (!entry) {
+      entry = this._emptyPeer();
+      this.peers.set(remoteId, entry);
+    }
+    if (entry.call) return;
+
+    const stream = this._getOutgoingStream();
+    if (!stream) return;
+
+    let call = null;
+    try {
+      call = this.network.peer.call(remoteId, stream, {
+        metadata: { name: this.store.values.callsign || '' },
+      });
+    } catch (error) {
+      this._scheduleRetry(remoteId);
+      return;
+    }
+    if (!call) {
+      this._scheduleRetry(remoteId);
+      return;
+    }
+
+    entry.call = call;
+    entry.outgoing = true;
+    entry.closed = false;
+
+    call.on('stream', (remoteStream) => this._attachStream(remoteId, remoteStream));
+    call.on('close', () => this._onCallClosed(remoteId));
+    call.on('error', () => this._onCallClosed(remoteId));
+  }
+
+  _scheduleRetry(remoteId) {
+    if (this._retryTimers.has(remoteId)) return;
+    const timer = window.setTimeout(() => {
+      this._retryTimers.delete(remoteId);
+      if (!this.peers.get(remoteId)) return;
+      const entry = this.peers.get(remoteId);
+      if (entry && !entry.call) this._initiateCall(remoteId);
+    }, 2600);
+    this._retryTimers.set(remoteId, timer);
+  }
+
+  acceptIncomingCall(call) {
+    if (!call) return;
+    if (!this.enabled || !this.network || !this.network.peer) {
+      try {
+        call.close();
+      } catch (error) {
+        /* ignore */
+      }
+      return;
+    }
+
+    const remoteId = call.peer;
+    if (!remoteId || remoteId === this.network.selfId) {
+      try {
+        call.close();
+      } catch (error) {
+        /* ignore */
+      }
+      return;
+    }
+
+    let entry = this.peers.get(remoteId);
+    if (!entry) {
+      entry = this._emptyPeer();
+      this.peers.set(remoteId, entry);
+    }
+
+    // Дедупликация: оставляем один канал на пару.
+    if (entry.call && entry.call !== call) {
+      const selfId = this.network.selfId;
+      if (entry.outgoing) {
+        if (selfId < remoteId) {
+          // Мы — инициатор: входящий дубль закрываем.
+          try {
+            call.close();
+          } catch (error) {
+            /* ignore */
+          }
+          return;
+        }
+        // Мы не инициатор: уступаем входящему, свой исходящий закрываем.
+        try {
+          entry.call.close();
+        } catch (error) {
+          /* ignore */
+        }
+        entry.call = null;
+      } else {
+        try {
+          call.close();
+        } catch (error) {
+          /* ignore */
+        }
+        return;
+      }
+    }
+
+    const outgoing = this._getOutgoingStream();
+    try {
+      if (outgoing) call.answer(outgoing);
+      else call.answer();
+    } catch (error) {
+      return;
+    }
+
+    entry.call = call;
+    entry.outgoing = false;
+    entry.closed = false;
+
+    call.on('stream', (remoteStream) => this._attachStream(remoteId, remoteStream));
+    call.on('close', () => this._onCallClosed(remoteId));
+    call.on('error', () => this._onCallClosed(remoteId));
+
+    if (this._retryTimers.has(remoteId)) {
+      window.clearTimeout(this._retryTimers.get(remoteId));
+      this._retryTimers.delete(remoteId);
+    }
+  }
+
+  _onCallClosed(remoteId) {
+    const entry = this.peers.get(remoteId);
+    if (!entry) return;
+    entry.call = null;
+    entry.outgoing = false;
+    entry.closed = true;
+    this._teardownAudio(entry);
+    // Если игрок ещё в лобби — попробуем восстановить канал.
+    if (this.network && this.network.roster.has(remoteId) && this.enabled) {
+      this._scheduleRetry(remoteId);
+    }
+  }
+
+  _attachStream(remoteId, stream) {
+    let entry = this.peers.get(remoteId);
+    if (!entry) {
+      entry = this._emptyPeer();
+      this.peers.set(remoteId, entry);
+    }
+    if (entry.stream === stream) return;
+
+    entry.stream = stream;
+    this._buildAudio(remoteId, entry);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Пространственное аудио
+  // ---------------------------------------------------------------------------
+
+  attachAvatar(remoteId, object3D) {
+    let entry = this.peers.get(remoteId);
+    if (!entry) {
+      entry = this._emptyPeer();
+      this.peers.set(remoteId, entry);
+    }
+    if (entry.object3D === object3D) return;
+    entry.object3D = object3D;
+    if (entry.audio) {
+      entry.audio.parent && entry.audio.parent.remove(entry.audio);
+      object3D.add(entry.audio);
+    } else if (entry.stream) {
+      this._buildAudio(remoteId, entry);
+    }
+  }
+
+  _buildAudio(remoteId, entry) {
+    if (!this.initialized || !entry.stream || !entry.object3D) return;
+    if (entry.audio) return;
+
+    const ctx = this.listener.context;
+    const source = ctx.createMediaStreamSource(entry.stream);
+
+    // «Рация»: срез низа, срез верха, подчёркнутая разборчивость и лёгкий грит.
+    const highpass = ctx.createBiquadFilter();
+    highpass.type = 'highpass';
+    highpass.frequency.value = 280;
+    highpass.Q.value = 0.7;
+
+    const lowpass = ctx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 3400;
+    lowpass.Q.value = 0.7;
+
+    const presence = ctx.createBiquadFilter();
+    presence.type = 'peaking';
+    presence.frequency.value = 1750;
+    presence.Q.value = 1.1;
+    presence.gain.value = 5;
+
+    const shaper = ctx.createWaveShaper();
+    shaper.curve = this._makeDistortionCurve(12);
+    shaper.oversample = '2x';
+
+    const voiceGain = ctx.createGain();
+    voiceGain.gain.value = CONFIG.voice.radioGain;
+
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.4;
+
+    source.connect(highpass);
+    highpass.connect(lowpass);
+    lowpass.connect(presence);
+    presence.connect(shaper);
+    shaper.connect(voiceGain);
+    voiceGain.connect(analyser);
+
+    const audio = new THREE.PositionalAudio(this.listener);
+    audio.setDistanceModel('inverse');
+    audio.setRefDistance(CONFIG.voice.refDistance);
+    audio.setRolloffFactor(CONFIG.voice.rolloff);
+    audio.setMaxDistance(CONFIG.voice.maxDistance);
+    audio.setVolume(1);
+    audio.setNodeSource(voiceGain);
+
+    entry.object3D.add(audio);
+
+    // Шум эфира, слышный только когда рядом кто-то говорит.
+    const staticSource = ctx.createBufferSource();
+    staticSource.buffer = this._noiseBuffer;
+    staticSource.loop = true;
+    const staticFilter = ctx.createBiquadFilter();
+    staticFilter.type = 'bandpass';
+    staticFilter.frequency.value = 1600;
+    staticFilter.Q.value = 1.4;
+    const staticGain = ctx.createGain();
+    staticGain.gain.value = 0;
+    staticSource.connect(staticFilter);
+    staticFilter.connect(staticGain);
+    staticGain.connect(voiceGain);
+    try {
+      staticSource.start();
+    } catch (error) {
+      /* ignore */
+    }
+
+    entry.audio = audio;
+    entry.gain = voiceGain;
+    entry.source = source;
+    entry.nodes = [highpass, lowpass, presence, shaper, voiceGain];
+    entry.staticNodes = [staticSource, staticFilter, staticGain];
+    entry.staticGain = staticGain;
+    entry.analyser = analyser;
+    entry.analyserData = new Uint8Array(analyser.fftSize);
+    entry.flat = null;
+
+    this._applyRouting(entry);
+    this.bus.emit('voice:peerAudio', { id: remoteId });
+  }
+
+  _makeDistortionCurve(amount) {
+    const samples = 44100;
+    const curve = new Float32Array(samples);
+    const k = amount;
+    for (let i = 0; i < samples; i += 1) {
+      const x = (i * 2) / samples - 1;
+      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
+    }
+    return curve;
+  }
+
+  _applyRouting(entry) {
+    if (!entry.gain) return;
+    const ctx = this.listener.context;
+    const flat = !this.enabled || !this.localInCar || !entry.inCar;
+
+    if (entry.flat === flat) return;
+    entry.flat = flat;
+
+    try {
+      entry.gain.disconnect();
+    } catch (error) {
+      /* ignore */
+    }
+
+    if (flat) {
+      entry.gain.connect(this.listener.getInput());
+      if (entry.audio) entry.audio.setVolume(1);
+    } else if (entry.audio) {
+      entry.gain.connect(entry.audio.getOutput());
+    }
+
+    // Возобновляем цепочку после переподключения узлов.
+    try {
+      entry.source && entry.source.disconnect();
+      entry.source.connect(entry.nodes[0]);
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  _teardownAudio(entry) {
+    if (entry.audio) {
+      if (entry.audio.parent) entry.audio.parent.remove(entry.audio);
+      try {
+        entry.audio.disconnect();
+      } catch (error) {
+        /* ignore */
+      }
+      entry.audio = null;
+    }
+    for (const node of entry.staticNodes || []) {
+      try {
+        node.stop && node.stop();
+      } catch (error) {
+        /* ignore */
+      }
+      try {
+        node.disconnect();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    entry.staticNodes = [];
+    for (const node of entry.nodes || []) {
+      try {
+        node.disconnect();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    entry.nodes = [];
+    if (entry.source) {
+      try {
+        entry.source.disconnect();
+      } catch (error) {
+        /* ignore */
+      }
+      entry.source = null;
+    }
+    if (entry.analyser) {
+      try {
+        entry.analyser.disconnect();
+      } catch (error) {
+        /* ignore */
+      }
+      entry.analyser = null;
+    }
+    entry.stream = null;
+    entry.gain = null;
+    entry.flat = null;
+    entry.level = 0;
+    entry.speaking = false;
+  }
+
+  removePeer(remoteId) {
+    this._closePeer(remoteId);
+  }
+
+  _closePeer(remoteId) {
+    const entry = this.peers.get(remoteId);
+    if (!entry) return;
+    window.clearTimeout(this._retryTimers.get(remoteId));
+    this._retryTimers.delete(remoteId);
+    if (entry.call) {
+      try {
+        entry.call.close();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    entry.call = null;
+    this._teardownAudio(entry);
+    this.peers.delete(remoteId);
+    this._emitStatus(true);
+  }
+
+  isSpeaking(remoteId) {
+    const entry = this.peers.get(remoteId);
+    return Boolean(entry && entry.speaking);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Push-to-talk
+  // ---------------------------------------------------------------------------
+
+  _onKeyDown(event) {
+    if (event.code !== 'KeyV' || this.mode !== 'ptt' || this.pttHeld) return;
+    if (event.repeat) return;
+    this.pttHeld = true;
+    this._applyTrackState();
+    if (this.enabled && !this.localStream && this.network && this.network.isActive) {
+      this._ensureLocal().then(() => this._applyTrackState());
+    }
+    this.bus.emit('voice:ptt', { active: true });
+  }
+
+  _onKeyUp(event) {
+    if (event.code !== 'KeyV' || !this.pttHeld) return;
+    this.pttHeld = false;
+    this._applyTrackState();
+    this.bus.emit('voice:ptt', { active: false });
+  }
+
+  _onBlur() {
+    if (!this.pttHeld) return;
+    this.pttHeld = false;
+    this._applyTrackState();
+    this.bus.emit('voice:ptt', { active: false });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Кадр
+  // ---------------------------------------------------------------------------
+
+  update(dt, elapsed) {
+    if (!this.initialized) return;
+    if (this.audio.ctx && this.audio.ctx.state === 'suspended') {
+      // Жест пользователя уже был — просто возобновляем.
+      this.audio.ctx.resume().catch(() => {});
+    }
+
+    // Локальный уровень для индикаторов.
+    if (this.localStream) {
+      const { level } = this.audio.getMicLevel();
+      this.localLevel = level;
+      const speaking = this.enabled && (this.mode === 'open' || this.pttHeld) && level > 0.12;
+      if (speaking !== this.localSpeaking) {
+        this.localSpeaking = speaking;
+        this.bus.emit('voice:localSpeaking', { speaking });
+      }
+    } else {
+      this.localLevel = 0;
+      this.localSpeaking = false;
+    }
+
+    // Удалённые игроки: пики, шум эфира, маршрутизация.
+    for (const entry of this.peers.values()) {
+      if (entry.analyser && entry.analyserData) {
+        entry.analyser.getByteTimeDomainData(entry.analyserData);
+        let sum = 0;
+        for (let i = 0; i < entry.analyserData.length; i += 1) {
+          const sample = (entry.analyserData[i] - 128) / 128;
+          sum += sample * sample;
+        }
+        const rms = Math.sqrt(sum / entry.analyserData.length);
+        const target = clamp((rms - 0.01) * 7, 0, 1);
+        entry.level += (target - entry.level) * 0.35;
+        entry.speaking = entry.level > 0.12;
+        if (entry.staticGain) {
+          const staticLevel = entry.speaking ? 0.006 + entry.level * 0.016 : 0.0006;
+          entry.staticGain.gain.setTargetAtTime(staticLevel, this.listener.context.currentTime, 0.08);
+        }
+      }
+
+      if (entry.audio) {
+        const flat = !this.enabled || !this.localInCar || !entry.inCar;
+        if (entry.flat !== flat) this._applyRouting(entry);
+        if (!flat && entry.object3D) {
+          const distance = this.camera.position.distanceTo(entry.object3D.position);
+          const fade = 1 - clamp(
+            (distance - CONFIG.voice.fadeStart) / (CONFIG.voice.fadeEnd - CONFIG.voice.fadeStart),
+            0,
+            1,
+          );
+          const volume = fade * fade * (this.enabled ? 1 : 0);
+          if (Math.abs(volume - (entry.volume ?? -1)) > 0.01) {
+            entry.volume = volume;
+            entry.audio.setVolume(volume);
+          }
+        }
+      }
+    }
+
+    this._emitStatus(false);
+  }
+
+  /** Микрофон отобрали в системе — восстанавливаем канал без перезапуска игры. */
+  async handleMicLost() {
+    window.clearTimeout(this._micRetryTimer);
+    if (!this.enabled || !this.network || !this.network.isActive) return;
+    this.bus.emit('voice:lost', {});
+    for (const id of Array.from(this.peers.keys())) this._closePeer(id);
+    this.localStream = null;
+    this._micRetryTimer = window.setTimeout(async () => {
+      await this._ensureLocal();
+      if (this._lastRoster) this.syncRoster(this._lastRoster);
+    }, 1400);
+  }
+
+  leave() {
+    window.clearTimeout(this._micRetryTimer);
+    this._lastRoster = null;
+    for (const id of Array.from(this.peers.keys())) this._closePeer(id);
+    this.peers.clear();
+    this._releaseLocal();
+    this.localInCar = false;
+    this.pttHeld = false;
+    this._emitStatus(true);
   }
 }
 
@@ -3505,6 +5689,13 @@ class UIManager {
     this._hauntTimer = 0;
     this._lobbyCodeText = '—';
     this._clockSeconds = 23 * 3600 + 58 * 60;
+    this._lobbyCode = '';
+    this._lobbyMode = 'host';
+    this._roster = [];
+    this._voiceState = null;
+    this._micTestActive = false;
+    this._copyTimer = 0;
+    this._lastCrewCount = 0;
     this._defaultStaminaCaption = 'SHIFT — БЕГ / ВЫНОСЛИВОСТЬ ВОССТАНАВЛИВАЕТСЯ В ПОКОЕ';
 
     this.el = {
@@ -3557,6 +5748,36 @@ class UIManager {
       pauseTitle: $('#pause-title'),
       pauseText: $('#pause-text'),
       pauseLobbyCode: $('#pause-lobby-code'),
+      pauseCrew: $('#pause-crew'),
+
+      lobby: $('#lobby-screen'),
+      lobbyTitle: $('#lobby-title'),
+      lobbySubtitle: $('#lobby-subtitle'),
+      lobbyCode: $('#lobby-code-value'),
+      lobbyStatus: $('#lobby-status'),
+      lobbyStatusText: $('#lobby-status-text'),
+      lobbyRoster: $('#lobby-roster-list'),
+      lobbyCount: $('#lobby-count'),
+      lobbyVoice: $('#lobby-voice'),
+      lobbyEnter: $('#btn-enter-car'),
+      lobbyLeave: $('#btn-leave-lobby'),
+      lobbyCopy: $('#btn-copy-code'),
+
+      ended: $('#modal-ended'),
+      endedTitle: $('#ended-title'),
+      endedText: $('#ended-text'),
+      endedButton: $('#btn-ended-menu'),
+
+      hudCrew: $('#hud-crew'),
+      hudPing: $('#hud-ping'),
+      hudVoice: $('#hud-voice'),
+      hudVoiceText: $('#hud-voice-text'),
+      menuVoiceStatus: $('#menu-voice-status'),
+
+      voiceEnabled: $('#voice-enabled'),
+      voiceModeButtons: $$('[data-voice-mode]'),
+      voiceHint: $('#voice-hint'),
+      callsign: $('#callsign'),
 
       clock: $('#menu-clock'),
     };
@@ -3569,6 +5790,27 @@ class UIManager {
 
     this.bus.on('player:stamina', (state) => this.setStamina(state));
     this.bus.on('network:lobbyCreated', (session) => this.setLobbyCode(session.code));
+    this.bus.on('network:lobbyReady', ({ code }) => {
+      this.setLobbyCode(code);
+      this.setNetworkStatus({ status: 'hosting' });
+    });
+    this.bus.on('network:roster', (roster) => this.onRoster(roster));
+    this.bus.on('network:status', (status) => this.setNetworkStatus(status));
+    this.bus.on('network:latency', ({ rtt }) => this.setLatency(rtt));
+    this.bus.on('voice:status', (state) => this.setVoiceState(state));
+    this.bus.on('voice:localSpeaking', ({ speaking }) => this.setLocalSpeaking(speaking));
+    this.bus.on('voice:ptt', ({ active }) => this.setPttActive(active));
+    this.bus.on('network:peerJoined', (player) => {
+      if (player) this.showToast(`${player.name} ВОШЁЛ В ВАГОН`, 'success', 3200);
+    });
+    this.bus.on('network:peerLeft', ({ player, reason } = {}) => {
+      if (!player) return;
+      if (reason === 'timeout') {
+        this.showToast(`${player.name}: СВЯЗЬ ПОТЕРЯНА`, 'warning', 3600);
+      } else {
+        this.showToast(`${player.name} ПОКИНУЛ ВАГОН`, 'info', 3200);
+      }
+    });
   }
 
   get isSettingsOpen() {
@@ -3639,6 +5881,58 @@ class UIManager {
       this.bus.emit('ui:exit');
     });
 
+    if (this.el.lobbyEnter) {
+      this.el.lobbyEnter.addEventListener('click', () => {
+        this.audio.uiConfirm();
+        this.bus.emit('ui:enterCar');
+      });
+    }
+    if (this.el.lobbyLeave) {
+      this.el.lobbyLeave.addEventListener('click', () => {
+        this.audio.uiBack();
+        this.bus.emit('ui:leaveLobby');
+      });
+    }
+    if (this.el.lobbyCopy) {
+      this.el.lobbyCopy.addEventListener('click', () => this._copyLobbyCode());
+    }
+    if (this.el.endedButton) {
+      this.el.endedButton.addEventListener('click', () => {
+        this.audio.uiBack();
+        this.bus.emit('ui:endedMenu');
+      });
+    }
+
+    if (this.el.voiceEnabled) {
+      this.el.voiceEnabled.addEventListener('change', () => {
+        const enabled = this.el.voiceEnabled.checked;
+        this.store.save({ voiceEnabled: enabled });
+        this.bus.emit('settings:voiceEnabled', enabled);
+      });
+    }
+    for (const button of this.el.voiceModeButtons) {
+      button.addEventListener('click', () => {
+        const mode = button.dataset.voiceMode;
+        if (!mode) return;
+        this.store.save({ voiceMode: mode });
+        this._applyVoiceModeUI(mode);
+        this.bus.emit('settings:voiceMode', mode);
+      });
+    }
+    if (this.el.callsign) {
+      let lastCallsign = this.store.values.callsign || '';
+      const commit = () => {
+        const value = this.el.callsign.value.trim().slice(0, 14);
+        this.el.callsign.value = value;
+        if (value === lastCallsign) return;
+        lastCallsign = value;
+        this.store.save({ callsign: value });
+        this.bus.emit('settings:callsign', value);
+      };
+      this.el.callsign.addEventListener('change', commit);
+      this.el.callsign.addEventListener('blur', commit);
+    }
+
     document.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') return;
       if (this._settingsOpen) {
@@ -3687,6 +5981,24 @@ class UIManager {
       ((sensitivityValue - 30) / (220 - 30)) * 100,
     );
     this.el.sensitivity.setAttribute('aria-valuetext', this.el.sensitivityValue.textContent);
+
+    if (this.el.voiceEnabled) this.el.voiceEnabled.checked = this.store.values.voiceEnabled !== false;
+    this._applyVoiceModeUI(this.store.values.voiceMode);
+    if (this.el.callsign) this.el.callsign.value = this.store.values.callsign || '';
+  }
+
+  _applyVoiceModeUI(mode) {
+    const current = mode === 'ptt' ? 'ptt' : 'open';
+    for (const button of this.el.voiceModeButtons) {
+      const active = button.dataset.voiceMode === current;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+    }
+    if (this.el.voiceHint) {
+      this.el.voiceHint.textContent = current === 'ptt'
+        ? 'Режим рации: удерживайте V, чтобы говорить. Остальное время микрофон молчит.'
+        : 'Открытый микрофон: голос передаётся постоянно. Тише у края слышимости — дальше 14 м эфир глохнет.';
+    }
   }
 
   _setSliderFill(slider, percent) {
@@ -3728,6 +6040,9 @@ class UIManager {
     this._applySettingsToUI();
     this.audio.setVolume(values.volume);
     this.bus.emit('settings:sensitivity', values.sensitivity);
+    this.bus.emit('settings:voiceEnabled', values.voiceEnabled);
+    this.bus.emit('settings:voiceMode', values.voiceMode);
+    this.bus.emit('settings:callsign', values.callsign || '');
     this.audio.uiConfirm();
     this.showToast('НАСТРОЙКИ СБРОШЕНЫ К ЗАВОДСКИМ ЗНАЧЕНИЯМ', 'info');
   }
@@ -3962,7 +6277,7 @@ class UIManager {
     const cleaned = this.el.joinInput.value
       .toUpperCase()
       .replace(/[^A-Z0-9]/g, '')
-      .slice(0, 6);
+      .slice(0, CONFIG.network.lobbyCodeLength);
     if (this.el.joinInput.value !== cleaned) this.el.joinInput.value = cleaned;
     if (!this.el.joinError.hidden) {
       this.el.joinError.hidden = true;
@@ -3984,8 +6299,8 @@ class UIManager {
     if (this._joining) return;
 
     const clean = this.network.sanitizeCode(this.el.joinInput.value);
-    if (clean.length < 4) {
-      this._showJoinError('КОД СЕАНСА ДОЛЖЕН СОДЕРЖАТЬ НЕ МЕНЕЕ 4 СИМВОЛОВ.');
+    if (clean.length !== CONFIG.network.lobbyCodeLength) {
+      this._showJoinError(`КОД ЛОББИ СОСТОИТ ИЗ ${CONFIG.network.lobbyCodeLength} СИМВОЛОВ.`);
       this.audio.uiError();
       this.el.joinInput.focus();
       return;
@@ -4012,9 +6327,8 @@ class UIManager {
     }
 
     this._showJoinError(
-      result && result.reason === 'not-implemented'
-        ? 'СЕТЕВОЙ МОДУЛЬ НЕ УСТАНОВЛЕН // ЧАСТЬ II. ДЛЯ ЛОКАЛЬНОГО СЕАНСА ИСПОЛЬЗУЙТЕ «СОЗДАТЬ ЛОББИ».'
-        : 'НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ К СЕАНСУ. ПРОВЕРЬТЕ КОД И ПОВТОРИТЕ ПОПЫТКУ.',
+      (result && result.message)
+        || 'НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ К СЕАНСУ. ПРОВЕРЬТЕ КОД И ПОВТОРИТЕ ПОПЫТКУ.',
     );
     this.audio.uiError();
   }
@@ -4032,6 +6346,8 @@ class UIManager {
     this.el.settings.hidden = true;
     this.el.join.hidden = true;
     this.el.pause.hidden = true;
+    if (this.el.lobby) this.el.lobby.hidden = true;
+    if (this.el.ended) this.el.ended.hidden = true;
     this.el.hud.hidden = false;
     this.el.hud.classList.remove('is-paused');
     this.el.hints.classList.remove('is-faded');
@@ -4052,12 +6368,264 @@ class UIManager {
     this.el.pause.hidden = true;
     this.el.settings.hidden = true;
     this.el.join.hidden = true;
+    if (this.el.lobby) this.el.lobby.hidden = true;
+    if (this.el.ended) this.el.ended.hidden = true;
     this.el.menu.hidden = false;
+    this._lobbyCode = '';
+    this._roster = [];
     this._settingsOpen = false;
     this.stopMicTest(false);
     this.setLobbyCode(null);
     window.clearTimeout(this._hintsTimer);
     window.setTimeout(() => this.el.create.focus({ preventScroll: true }), 0);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Лобби
+  // ---------------------------------------------------------------------------
+
+  showLobby({ code, mode = 'host' } = {}) {
+    if (!this.el.lobby) return;
+    this._lobbyMode = mode;
+    this._lobbyCode = code || this._lobbyCode || '';
+    this.el.menu.hidden = true;
+    this.el.join.hidden = true;
+    this.el.settings.hidden = true;
+    if (this.el.ended) this.el.ended.hidden = true;
+    this.el.lobby.hidden = false;
+    this.setLobbyCode(this._lobbyCode);
+    this._renderLobbyCode();
+    this._renderRoster();
+    this.setNetworkStatus({ status: mode === 'host' ? 'hosting' : 'connecting' });
+    window.setTimeout(() => this.el.lobbyEnter && this.el.lobbyEnter.focus({ preventScroll: true }), 40);
+  }
+
+  hideLobby() {
+    if (this.el.lobby) this.el.lobby.hidden = true;
+  }
+
+  _renderLobbyCode() {
+    if (!this.el.lobbyCode) return;
+    this.el.lobbyCode.textContent = this._lobbyCode || '—';
+    this.el.lobbyCode.classList.toggle('is-empty', !this._lobbyCode);
+  }
+
+  _copyLobbyCode() {
+    if (!this._lobbyCode) return;
+    const done = () => {
+      this.audio.uiConfirm();
+      this.showToast(`КОД ${this._lobbyCode} СКОПИРОВАН`, 'success', 2400);
+      if (this.el.lobbyCopy) {
+        this.el.lobbyCopy.classList.add('is-done');
+        window.clearTimeout(this._copyTimer);
+        this._copyTimer = window.setTimeout(() => {
+          this.el.lobbyCopy.classList.remove('is-done');
+        }, 1400);
+      }
+    };
+    const fallback = () => {
+      try {
+        const area = document.createElement('textarea');
+        area.value = this._lobbyCode;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand('copy');
+        document.body.removeChild(area);
+        done();
+      } catch (error) {
+        this.showToast(`КОД: ${this._lobbyCode}`, 'info', 5000);
+      }
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(this._lobbyCode).then(done).catch(fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  setNetworkStatus({ status, detail } = {}) {
+    const map = {
+      idle: ['СОЕДИНЕНИЕ НЕ УСТАНОВЛЕНО', 'idle'],
+      signaling: ['УСТАНОВКА СВЯЗИ С СЕРВЕРОМ...', 'pending'],
+      hosting: ['КАНАЛ ОТКРЫТ · ЖДЁМ ПАССАЖИРОВ', 'ok'],
+      connecting: ['ПОДКЛЮЧЕНИЕ К ХОСТУ...', 'pending'],
+      connected: ['СВЯЗЬ С ХОСТОМ УСТАНОВЛЕНА', 'ok'],
+      reconnecting: [detail || 'ПЕРЕПОДКЛЮЧЕНИЕ...', 'warn'],
+      error: [detail || 'СВЯЗЬ ПОТЕРЯНА', 'error'],
+    };
+    const entry = map[status] || map.idle;
+    if (this.el.lobbyStatus) {
+      this.el.lobbyStatus.dataset.state = entry[1];
+    }
+    if (this.el.lobbyStatusText) this.el.lobbyStatusText.textContent = entry[0];
+  }
+
+  setLatency(rtt) {
+    if (!this.el.hudPing) return;
+    if (!Number.isFinite(rtt)) {
+      this.el.hudPing.textContent = '— мс';
+      this.el.hudPing.dataset.state = 'idle';
+      return;
+    }
+    this.el.hudPing.textContent = `${rtt} мс`;
+    this.el.hudPing.dataset.state = rtt < 120 ? 'ok' : rtt < 260 ? 'warn' : 'error';
+  }
+
+  onRoster(roster) {
+    this._roster = Array.isArray(roster.players) ? roster.players : [];
+    this._selfId = roster.selfId || null;
+    this._hostId = roster.hostId || null;
+    this._isHost = Boolean(roster.isHost);
+    this._maxPlayers = roster.maxPlayers || CONFIG.network.maxPlayers;
+    this._renderRoster();
+  }
+
+  _renderRoster() {
+    if (!this.el.lobbyRoster) return;
+    const players = this._roster || [];
+    const max = this._maxPlayers || CONFIG.network.maxPlayers;
+
+    if (this.el.lobbyCount) {
+      this.el.lobbyCount.textContent = `${players.length} / ${max}`;
+      this.el.lobbyCount.dataset.state = players.length >= max ? 'full' : 'ok';
+    }
+    if (this.el.lobbyTitle) {
+      this.el.lobbyTitle.textContent = this._isHost ? 'Вагон открыт' : 'Вагон найден';
+    }
+    if (this.el.lobbySubtitle) {
+      this.el.lobbySubtitle.textContent = this._isHost
+        ? 'Передайте код экипажу. Как только все будут на месте — входите в салон.'
+        : 'Хост уже в вагоне. Проверьте состав и входите.';
+    }
+    if (this.el.hudCrew) {
+      this.el.hudCrew.textContent = `${players.length}/${max}`;
+    }
+    if (this.el.pauseCrew) this.el.pauseCrew.textContent = `${players.length}/${max}`;
+
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < max; index += 1) {
+      const player = players[index];
+      const row = document.createElement('li');
+      row.className = 'roster-row';
+      if (!player) {
+        row.classList.add('is-empty');
+        row.innerHTML = '<span class="roster-slot"></span><span class="roster-name">СВОБОДНОЕ МЕСТО</span><span class="roster-badge">—</span>';
+      } else {
+        if (player.id === this._selfId) row.classList.add('is-self');
+        if (player.host) row.classList.add('is-host');
+        const slot = String(player.slot || index + 1).padStart(2, '0');
+        const name = document.createElement('span');
+        name.className = 'roster-name';
+        name.textContent = player.name;
+
+        const badge = document.createElement('span');
+        badge.className = 'roster-badge';
+        const parts = [];
+        if (player.host) parts.push('ХОСТ');
+        else if (Number.isFinite(player.ping)) parts.push(`${player.ping} МС`);
+        if (player.id === this._selfId) parts.push('ВЫ');
+        badge.textContent = parts.join(' · ') || 'В ЭФИРЕ';
+
+        const slotEl = document.createElement('span');
+        slotEl.className = 'roster-slot';
+        slotEl.textContent = slot;
+
+        row.append(slotEl, name, badge);
+        if (player.id === this._selfId) {
+          const dot = document.createElement('span');
+          dot.className = 'roster-dot';
+          dot.title = 'Это вы';
+          row.append(dot);
+        }
+      }
+      fragment.appendChild(row);
+    }
+    this.el.lobbyRoster.replaceChildren(fragment);
+
+    if (this._lastCrewCount && players.length > this._lastCrewCount && this._lobbyMode === 'host') {
+      this.audio.uiConfirm();
+    }
+    this._lastCrewCount = players.length;
+
+    const empty = players.length <= 1;
+    if (this.el.lobbyEnter) {
+      this.el.lobbyEnter.disabled = false;
+      this.el.lobbyEnter.textContent = empty && this._isHost ? 'Войти одному' : 'Войти в салон';
+    }
+  }
+
+  setVoiceState(state) {
+    if (!state) return;
+    this._voiceState = state;
+
+    let label = 'ГОЛОС: ВЫКЛ';
+    let chip = 'off';
+    if (state.enabled) {
+      if (!state.supported) {
+        label = 'ГОЛОС: НЕ ПОДДЕРЖИВАЕТСЯ';
+        chip = 'error';
+      } else if (state.permission === 'denied') {
+        label = 'ГОЛОС: НЕТ ДОСТУПА К МИКРОФОНУ';
+        chip = 'error';
+      } else if (!state.active) {
+        label = state.mode === 'ptt' ? 'ГОЛОС: РАЦИЯ · НЕТ МИКРОФОНА' : 'ГОЛОС: ОЖИДАНИЕ МИКРОФОНА';
+        chip = 'warn';
+      } else {
+        const mode = state.mode === 'ptt' ? 'РАЦИЯ V' : 'ОТКРЫТЫЙ';
+        const peers = state.peers ? ` · ${state.peers} В КАНАЛЕ` : '';
+        label = `ГОЛОС: ${mode}${peers}`;
+        chip = 'on';
+      }
+    }
+
+    if (this.el.lobbyVoice) {
+      this.el.lobbyVoice.dataset.state = chip;
+      this.el.lobbyVoice.textContent = label;
+    }
+    if (this.el.hudVoice) {
+      this.el.hudVoice.dataset.state = chip;
+      if (this.el.hudVoiceText) this.el.hudVoiceText.textContent = label.replace('ГОЛОС: ', '');
+    }
+    if (this.el.menuVoiceStatus) {
+      this.el.menuVoiceStatus.dataset.state = chip;
+      this.el.menuVoiceStatus.textContent = label;
+    }
+    if (this.el.voiceModeButtons && this.el.voiceModeButtons.length) {
+      this._applyVoiceModeUI(state.mode);
+    }
+  }
+
+  setLocalSpeaking(speaking) {
+    if (this.el.hudVoice) this.el.hudVoice.classList.toggle('is-speaking', Boolean(speaking));
+    if (this.el.lobbyVoice) this.el.lobbyVoice.classList.toggle('is-speaking', Boolean(speaking));
+  }
+
+  setPttActive(active) {
+    if (this.el.hudVoice) this.el.hudVoice.classList.toggle('is-ptt', Boolean(active));
+    if (this.el.menuVoiceStatus) this.el.menuVoiceStatus.classList.toggle('is-ptt', Boolean(active));
+    if (this.el.lobbyVoice) this.el.lobbyVoice.classList.toggle('is-ptt', Boolean(active));
+  }
+
+  showEnded({ title, text }) {
+    if (!this.el.ended) return;
+    this.el.menu.hidden = true;
+    this.el.join.hidden = true;
+    this.el.settings.hidden = true;
+    this._stopHaunt();
+    this.el.hud.hidden = true;
+    this.el.pause.hidden = true;
+    this.el.endedTitle.textContent = title;
+    this.el.endedText.textContent = text;
+    this.el.ended.hidden = false;
+    window.setTimeout(() => this.el.endedButton.focus({ preventScroll: true }), 40);
+  }
+
+  hideEnded() {
+    if (this.el.ended) this.el.ended.hidden = true;
   }
 
   showPause(options = {}) {
@@ -4256,12 +6824,42 @@ class Game {
       network: this.network,
     });
 
-    this.network.setLocalStateProvider(() => this.player.getNetworkState());
+    // Голос строится на том же AudioContext, что и эмбиент (см. VoiceChat.init).
+    this.voice = new VoiceChat({
+      audio: this.audio,
+      bus: this.bus,
+      scene: this.scene,
+      camera: this.camera,
+      store: this.store,
+    });
+    this.remotePlayers = new RemotePlayers({
+      scene: this.scene,
+      camera: this.camera,
+      bus: this.bus,
+      voice: this.voice,
+      world: this.world,
+    });
+
+    this._localInCar = false;
+    this.network.setLocalStateProvider(() => {
+      const state = this.player.getNetworkState();
+      state.c = this._localInCar ? 1 : 0;
+      return state;
+    });
+    this.network.setNameProvider(() => this.store.values.callsign || '');
+    this.network.setVoiceChat(this.voice);
+    this.voice.setNetwork(this.network);
+    this.remotePlayers.setNetwork(this.network);
+
+    // Потерянный микрофон: пробуем вернуть канал, не выкидывая из игры.
+    this.audio.onMicLost = () => this.voice.handleMicLost();
+
     this.audio.setVolume(this.store.values.volume);
     this.audio.setScene('menu');
 
     this._bindEvents();
     this._setupMenuView();
+    this._requestStartupMic();
 
     this.state = STATE.MENU;
     this.clock.start();
@@ -4282,9 +6880,26 @@ class Game {
 
   _bindEvents() {
     this.bus.on('ui:createLobby', () => this.createLobby());
+    this.bus.on('ui:sessionJoined', (result) => this.joinSession(result));
+    this.bus.on('ui:enterCar', () => this.enterCar());
+    this.bus.on('ui:leaveLobby', () => this.leaveLobby());
+    this.bus.on('ui:endedMenu', () => this.closeEndedScreen());
     this.bus.on('ui:resume', () => this.resumeSession());
     this.bus.on('ui:exit', () => this.exitToMenu());
     this.bus.on('settings:sensitivity', (value) => this.player.setSensitivity(value));
+
+    this.bus.on('settings:voiceEnabled', (enabled) => this.voice.setEnabled(enabled));
+    this.bus.on('settings:voiceMode', (mode) => this.voice.setMode(mode));
+    this.bus.on('settings:callsign', (name) => this._syncCallsign(name));
+
+    this.bus.on('network:roster', (roster) => {
+      this.remotePlayers.sync(roster);
+      this.voice.syncRoster(roster);
+    });
+    this.bus.on('network:hostLeft', ({ reason, wasHost }) => this._onHostLeft(reason, wasHost));
+    this.bus.on('network:warning', ({ message }) => this.ui.showToast(message, 'warning', 6000));
+    this.bus.on('voice:lost', () => this.ui.showToast('МИКРОФОН ОТКЛЮЧЁН // ВОССТАНОВЛЕНИЕ КАНАЛА...', 'warning', 5000));
+    this.bus.on('session:started', () => this.voice.setLocalInCar(true));
 
     // Усталость игрока притемняет салон — «дыхание» становится частью хоррора.
     this.bus.on('player:stamina', (state) => {
@@ -4373,7 +6988,36 @@ class Game {
   // Жизненный цикл сеанса
   // ---------------------------------------------------------------------------
 
-  createLobby(options = {}) {
+  /** Запрос микрофона на старте: разрешение спрашиваем сразу, поток не держим. */
+  _requestStartupMic() {
+    if (this.store.values.voiceEnabled === false) return;
+    this._micProbeTimer = window.setTimeout(() => {
+      this.voice.probePermission();
+    }, 900);
+  }
+
+  _syncCallsign(name) {
+    const clean = this.network._sanitizeName(name);
+    if (this.network.isActive) {
+      if (this.network.isHost) {
+        const me = this.network.roster.get(this.network.selfId);
+        if (me) {
+          me.name = clean || 'ПАССАЖИР 1';
+          this.network._broadcastRoster();
+          this.network._emitRoster();
+        }
+      } else if (this.network._hostConn) {
+        this.network._send(this.network._hostConn, { t: 'hello', name: clean });
+      }
+    }
+    this.ui.showToast(clean ? `ПОЗЫВНОЙ: ${clean}` : 'ПОЗЫВНОЙ СБРОШЕН', 'info', 2400);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Лобби
+  // ---------------------------------------------------------------------------
+
+  async createLobby(options = {}) {
     if (this.state !== STATE.MENU) return;
     // Зажатая клавиша не должна повторно входить в сеанс после выхода
     // (но программный вход, например из автотеста, это правило не ловит).
@@ -4386,23 +7030,165 @@ class Game {
       );
     }
 
+    this._createToken = (this._createToken || 0) + 1;
+    const token = this._createToken;
+
     this.audio.init();
-    this.session = this.network.createLobby();
+    this.voice.init();
+    this._menuEnteredAt = performance.now();
+
+    this.state = STATE.LOBBY;
+    this.ui.showLobby({ code: '', mode: 'host' });
+
+    const result = await this.network.hostLobby();
+
+    if (token !== this._createToken) return;
+    if (this.state !== STATE.LOBBY) return;
+
+    if (!result || !result.ok) {
+      this.state = STATE.MENU;
+      this.ui.hideLobby();
+      this.ui.showMenu();
+      this.ui.showToast((result && result.message) || 'НЕ УДАЛОСЬ ОТКРЫТЬ ЛОББИ.', 'error', 6500);
+      this.audio.uiError();
+      return;
+    }
+
+    this.session = this.network.session;
+    this.ui.showLobby({ code: result.code, mode: 'host' });
+    this.ui.showToast(
+      `ЛОББИ 06-${result.code} ОТКРЫТО // ПЕРЕДАЙТЕ КОД ЭКИПАЖУ`,
+      'success',
+      6000,
+    );
+  }
+
+  joinSession(result) {
+    if (!result || !result.ok || !result.session) return;
+    this.session = result.session;
+    this.state = STATE.LOBBY;
+    this._menuEnteredAt = performance.now();
+    this.voice.init();
+    this.ui.showLobby({ code: result.session.code, mode: 'guest' });
+    this.ui.setNetworkStatus({ status: 'connected' });
+    this.ui.showToast(
+      `ПОДКЛЮЧЕНИЕ УСТАНОВЛЕНО // ЛОББИ 06-${result.session.code}`,
+      'success',
+      4600,
+    );
+  }
+
+  _spawnForSelf() {
+    const base = this.world.spawn || CONFIG.player.spawn;
+    const roster = this.network.getPlayers();
+    const index = Math.max(0, roster.findIndex((player) => player.id === this.network.selfId));
+    const row = Math.floor(index / 2);
+    return {
+      x: base.x + (index % 2 === 0 ? 0.24 : -0.24),
+      z: base.z - row * 0.85 - (index % 2) * 0.25,
+      yaw: Math.PI,
+    };
+  }
+
+  enterCar() {
+    if (this.state !== STATE.LOBBY) return;
+    if (!this.network.isActive) {
+      this.ui.showToast('СВЯЗЬ С ЛОББИ ПОТЕРЯНА. ВЕРНИТЕСЬ В МЕНЮ.', 'error', 5200);
+      this.leaveLobby();
+      return;
+    }
+
+    this._clearLockFallback();
     this.state = STATE.DEPLOYING;
 
-    this.player.reset();
+    const spawn = this._spawnForSelf();
+    this.player.reset(spawn);
     this.player.setEnabled(false);
-    this.ui.enterGame(this.session.code);
+    this._localInCar = true;
+    this.ui.enterGame(this.session ? this.session.code : this.network.session.code);
     this.audio.setScene('game');
+    this.voice.setLocalInCar(true);
     this.clock.getDelta();
 
+    const crew = Math.max(1, this.network.getPlayers().length);
     this.ui.showToast(
-      `ЛОКАЛЬНЫЙ СЕАНС 06-${this.session.code} // ЭКИПАЖ: 1 // ОЖИДАНИЕ СЕТИ`,
+      `СЕАНС 06-${this.session.code} // ЭКИПАЖ: ${crew}`,
       'info',
-      4600,
+      4200,
     );
 
     this._requestPointerLock(true);
+  }
+
+  leaveLobby() {
+    if (this.state !== STATE.LOBBY && this.state !== STATE.DEPLOYING
+      && this.state !== STATE.PLAYING && this.state !== STATE.PAUSED) {
+      return;
+    }
+    this._clearLockFallback();
+    this._menuEnteredAt = performance.now();
+    this.state = STATE.MENU;
+
+    this.player.setEnabled(false);
+    this.player.unlock();
+    this._localInCar = false;
+    this.voice.leave();
+    this.remotePlayers.clear();
+    this.network.leave();
+    this.session = null;
+
+    this.audio.setScene('menu');
+    this.ui.showMenu();
+    this.player.reset();
+    this._setupMenuView();
+    this.clock.getDelta();
+    this.bus.emit('session:ended');
+  }
+
+  _onHostLeft(reason, wasHost = false) {
+    if (this.state !== STATE.LOBBY && this.state !== STATE.DEPLOYING
+      && this.state !== STATE.PLAYING && this.state !== STATE.PAUSED) {
+      return;
+    }
+
+    this._clearLockFallback();
+    this.state = STATE.MENU;
+    this._menuEnteredAt = performance.now();
+    this.player.setEnabled(false);
+    this.player.unlock();
+    this._localInCar = false;
+    this.voice.leave();
+    this.remotePlayers.clear();
+    this.session = null;
+    this.audio.setScene('menu');
+
+    let title = 'ХОСТ ПОКИНУЛ ВАГОН';
+    let text = 'Двери захлопнулись, и голос в рации смолк. Лобби больше не существует — вернитесь в меню и подключитесь заново.';
+    let toast = 'ХОСТ ЗАВЕРШИЛ СЕАНС';
+
+    if (wasHost) {
+      title = 'СИГНАЛЬНЫЙ УЗЕЛ ПОТЕРЯН';
+      text = 'Связь с сигнальным сервером оборвалась, и пассажиры потеряли ваш вагон. Проверьте сеть и создайте лобби заново.';
+      toast = 'СЕАНС ЗАВЕРШЁН: НЕТ СВЯЗИ';
+    } else if (reason === 'timeout') {
+      title = 'СВЯЗЬ ПОТЕРЯНА';
+      text = 'Сигналы хозяина вагона стихли. Проводник закрыл сеанс — вернитесь в меню и подключитесь к новому лобби.';
+      toast = 'СВЯЗЬ С ХОСТОМ ПОТЕРЯНА';
+    }
+
+    this.ui.showEnded({ title, text });
+    this.ui.showToast(toast, 'warning', 5000);
+    this.bus.emit('session:ended');
+  }
+
+  closeEndedScreen() {
+    this.ui.hideEnded();
+    this.ui.showMenu();
+    this.player.reset();
+    this._setupMenuView();
+    this.state = STATE.MENU;
+    this._menuEnteredAt = performance.now();
+    this.clock.getDelta();
   }
 
   _requestPointerLock(initial = false) {
@@ -4501,9 +7287,13 @@ class Game {
 
     this.player.setEnabled(false);
     this.player.unlock();
+    this._localInCar = false;
+    this.voice.leave();
+    this.remotePlayers.clear();
     this.network.leave();
     this.session = null;
 
+    this.ui.hideEnded();
     this.audio.setScene('menu');
     this.ui.showMenu();
     this.player.reset();
@@ -4536,7 +7326,7 @@ class Game {
 
     if (this.state === STATE.PLAYING) {
       this.player.update(dt, this.elapsed);
-    } else if (this.state === STATE.MENU) {
+    } else if (this.state === STATE.MENU || this.state === STATE.LOBBY) {
       this._updateMenuCamera(this.elapsed);
     }
 
@@ -4546,6 +7336,10 @@ class Game {
 
     this.world.update(dt, this.elapsed);
     this.network.update(dt);
+    if (this.state !== STATE.MENU) {
+      this.remotePlayers.update(dt, this.elapsed);
+      this.voice.update(dt, this.elapsed);
+    }
     this.audio.update(dt);
     this.renderer.render(this.scene, this.camera);
   }
@@ -4553,7 +7347,18 @@ class Game {
   dispose() {
     window.cancelAnimationFrame(this._raf);
     this._clearLockFallback();
-    this.audio.disableMic();
+    window.clearTimeout(this._micProbeTimer);
+    try {
+      this.voice.leave();
+    } catch (error) {
+      /* ignore */
+    }
+    try {
+      this.network.leave({ silent: true });
+    } catch (error) {
+      /* ignore */
+    }
+    this.audio.hardStopMic();
   }
 }
 
@@ -4596,8 +7401,12 @@ function startGame() {
       TrainCar,
       PlayerController,
       NetworkManager,
+      RemotePlayers,
+      VoiceChat,
       UIManager,
     },
+    voice: game.voice,
+    remotePlayers: game.remotePlayers,
   };
 
   window.addEventListener('pagehide', () => game.dispose(), { once: true });
