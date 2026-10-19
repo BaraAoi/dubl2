@@ -2344,6 +2344,540 @@
        АДАПТИВНОСТЬ
        ============================================================ */
 
+    /* ============================================================
+       ЧАСТЬ II — ЛОББИ, ЭКИПАЖ, ГОЛОС
+       ============================================================ */
+
+    kbd {
+      display: inline-block;
+      padding: 1px 5px;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.35);
+      color: var(--ink-dim);
+      font-family: var(--font-mono);
+      font-size: 0.86em;
+      letter-spacing: 0.06em;
+    }
+
+    .menu-voice {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--line-soft);
+      color: var(--ink-faint);
+      font-size: 8px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .menu-voice[data-state="on"] { color: var(--green-dim); }
+    .menu-voice[data-state="warn"] { color: var(--amber); }
+    .menu-voice[data-state="error"] { color: var(--red); }
+    .menu-voice.is-ptt { color: var(--amber); }
+
+    /* ---------- Переключатель и сегменты ---------- */
+
+    .switch-line {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 10px;
+      border: 1px solid var(--line-soft);
+      background: rgba(0, 0, 0, 0.24);
+      color: var(--ink-dim);
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .switch-line input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .switch-ui {
+      position: relative;
+      flex: 0 0 auto;
+      width: 30px;
+      height: 16px;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.5);
+      transition: border-color 160ms, background 160ms;
+    }
+
+    .switch-ui::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 10px;
+      height: 10px;
+      background: var(--ink-faint);
+      transition: transform 160ms var(--ease-out), background 160ms;
+    }
+
+    .switch-line input:checked + .switch-ui {
+      border-color: rgba(185, 247, 164, 0.45);
+      background: rgba(185, 247, 164, 0.1);
+    }
+
+    .switch-line input:checked + .switch-ui::after {
+      transform: translateX(14px);
+      background: var(--green);
+      box-shadow: 0 0 10px rgba(185, 247, 164, 0.6);
+    }
+
+    .switch-line input:focus-visible + .switch-ui {
+      outline: 1px solid var(--green);
+      outline-offset: 4px;
+    }
+
+    .voice-mode-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px dashed var(--line-soft);
+    }
+
+    .voice-mode-label {
+      color: var(--ink-dim);
+      font-size: 9px;
+      letter-spacing: 0.13em;
+      text-transform: uppercase;
+    }
+
+    .segmented {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      background: rgba(0, 0, 0, 0.3);
+    }
+
+    .segmented-btn {
+      min-height: 32px;
+      padding: 7px 13px;
+      border: 0;
+      border-left: 1px solid var(--line-soft);
+      background: transparent;
+      color: var(--ink-faint);
+      font-size: 8px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      transition: background 160ms, color 160ms;
+    }
+
+    .segmented-btn:first-child { border-left: 0; }
+
+    .segmented-btn:hover { color: var(--green); }
+
+    .segmented-btn.is-active {
+      background: rgba(185, 247, 164, 0.12);
+      color: var(--green-strong);
+    }
+
+    .voice-hint {
+      margin: 12px 0 0;
+      color: var(--ink-faint);
+      font-size: 9px;
+      line-height: 1.7;
+      letter-spacing: 0.02em;
+    }
+
+    .voice-hint--small {
+      font-size: 8px;
+      color: var(--ink-faint);
+      opacity: 0.85;
+    }
+
+    .field-label--spaced {
+      margin-top: 16px;
+    }
+
+    .text-input {
+      width: 100%;
+      min-height: 42px;
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 0;
+      background: rgba(0, 0, 0, 0.36);
+      color: var(--green);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      transition: border-color 160ms, box-shadow 160ms;
+    }
+
+    .text-input::placeholder { color: var(--ink-faint); letter-spacing: 0.14em; }
+
+    .text-input:focus {
+      outline: none;
+      border-color: var(--line-strong);
+      box-shadow: 0 0 0 1px rgba(185, 247, 164, 0.18), 0 0 22px rgba(185, 247, 164, 0.06);
+    }
+
+    /* ---------- Экран лобби ---------- */
+
+    .lobby-screen {
+      display: grid;
+      place-items: center;
+      z-index: 30;
+      padding: 20px;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      background:
+        radial-gradient(ellipse at 50% 38%, rgba(8, 17, 12, 0.62), rgba(1, 3, 2, 0.95) 78%),
+        rgba(1, 3, 2, 0.78);
+      backdrop-filter: blur(6px) saturate(0.75);
+      -webkit-backdrop-filter: blur(6px) saturate(0.75);
+    }
+
+    .lobby-screen::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        to bottom,
+        transparent 0,
+        transparent 3px,
+        rgba(0, 0, 0, 0.14) 4px
+      );
+      opacity: 0.5;
+    }
+
+    .lobby-shell {
+      width: min(720px, 100%);
+      max-height: min(96vh, 900px);
+      overflow: auto;
+      animation: modal-in 0.34s var(--ease-out) both;
+      scrollbar-width: thin;
+      scrollbar-color: var(--green-dark) transparent;
+    }
+
+    .lobby-body { padding: clamp(14px, 2.2vw, 22px); }
+
+    .lobby-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+
+    .lobby-head h2 {
+      margin: 2px 0 4px;
+      color: var(--ink);
+      font-size: clamp(22px, 3.2vw, 30px);
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      line-height: 1.1;
+      text-transform: uppercase;
+    }
+
+    .lobby-head p {
+      max-width: 46ch;
+      margin: 0;
+      color: var(--ink-faint);
+      font-size: 10px;
+      line-height: 1.7;
+    }
+
+    .status-chip[data-state="on"] {
+      color: var(--green);
+      border-color: rgba(185, 247, 164, 0.34);
+    }
+
+    .status-chip[data-state="on"]::before {
+      background: var(--green);
+      box-shadow: 0 0 8px rgba(185, 247, 164, 0.8);
+      animation: dot-blink 1.7s steps(1) infinite;
+    }
+
+    .status-chip[data-state="warn"] {
+      color: var(--amber);
+      border-color: rgba(255, 191, 105, 0.3);
+    }
+
+    .status-chip[data-state="warn"]::before { background: var(--amber); }
+
+    .status-chip[data-state="error"]::before { background: var(--red); }
+
+    .status-chip[data-state="ok"] { color: var(--green-dim); }
+
+    .lobby-code-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: clamp(12px, 2.4vw, 24px);
+      margin: 12px 0 14px;
+      padding: 11px 16px;
+      border: 1px solid rgba(185, 247, 164, 0.26);
+      background:
+        linear-gradient(135deg, rgba(185, 247, 164, 0.07), transparent 62%),
+        rgba(0, 0, 0, 0.42);
+      box-shadow: inset 0 0 40px rgba(185, 247, 164, 0.03);
+    }
+
+    .lobby-code-label {
+      color: var(--ink-dim);
+      font-size: 9px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      line-height: 1.7;
+    }
+
+    .lobby-code-label small {
+      display: block;
+      color: var(--ink-faint);
+      font-size: 8px;
+      letter-spacing: 0.1em;
+      opacity: 0.8;
+    }
+
+    .lobby-code-value {
+      color: var(--green-strong);
+      font-size: clamp(30px, 5.2vw, 46px);
+      font-weight: 600;
+      letter-spacing: 0.24em;
+      line-height: 1;
+      text-indent: 0.24em;
+      text-shadow: 0 0 26px rgba(185, 247, 164, 0.34);
+      white-space: nowrap;
+    }
+
+    .lobby-code-value.is-empty { color: var(--ink-faint); text-shadow: none; }
+
+    .lobby-copy.is-done {
+      border-color: rgba(185, 247, 164, 0.5);
+      color: var(--green);
+      background: rgba(185, 247, 164, 0.12);
+    }
+
+    .lobby-roster-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      color: var(--ink-faint);
+      font-size: 9px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    .lobby-roster-head b {
+      color: var(--ink-dim);
+      font-weight: 500;
+      letter-spacing: 0.12em;
+    }
+
+    .lobby-roster-head b[data-state="full"] { color: var(--amber); }
+
+    .roster-list {
+      display: grid;
+      gap: 4px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .roster-row {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) auto 10px;
+      align-items: center;
+      gap: 10px;
+      min-height: 32px;
+      padding: 5px 11px;
+      border: 1px solid var(--line-soft);
+      background: rgba(2, 6, 4, 0.42);
+      color: var(--ink-dim);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+    }
+
+    .roster-row.is-self {
+      border-color: rgba(185, 247, 164, 0.28);
+      background: rgba(185, 247, 164, 0.055);
+      color: var(--ink);
+    }
+
+    .roster-row.is-empty {
+      border-style: dashed;
+      border-color: rgba(185, 247, 164, 0.09);
+      color: var(--ink-faint);
+      opacity: 0.65;
+    }
+
+    .roster-slot {
+      color: var(--ink-faint);
+      font-size: 9px;
+      letter-spacing: 0.14em;
+    }
+
+    .roster-row.is-self .roster-slot { color: var(--green-dim); }
+
+    .roster-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-transform: uppercase;
+    }
+
+    .roster-badge {
+      color: var(--ink-faint);
+      font-size: 8px;
+      letter-spacing: 0.12em;
+      white-space: nowrap;
+    }
+
+    .roster-row.is-host .roster-badge { color: var(--amber); }
+    .roster-row.is-self .roster-badge { color: var(--green-dim); }
+
+    .roster-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px rgba(185, 247, 164, 0.8);
+    }
+
+    .lobby-voice-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--line-soft);
+    }
+
+    .lobby-voice-row .status-chip { flex: 0 0 auto; }
+    .lobby-voice-row .status-chip.is-speaking {
+      color: var(--green-strong);
+      border-color: var(--green);
+      box-shadow: 0 0 18px rgba(185, 247, 164, 0.22);
+    }
+    .lobby-voice-row .status-chip.is-ptt { color: var(--amber); border-color: rgba(255, 191, 105, 0.5); }
+
+    .lobby-hint {
+      margin: 0;
+      color: var(--ink-faint);
+      font-size: 9px;
+      line-height: 1.6;
+    }
+
+    .lobby-actions {
+      justify-content: space-between;
+      margin-top: 14px;
+    }
+
+    .lobby-footnote {
+      margin: 12px 0 0;
+      padding-top: 9px;
+      border-top: 1px solid var(--line-soft);
+      color: var(--ink-faint);
+      font-size: 8px;
+      line-height: 1.9;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+
+    .ended-title {
+      margin: 6px 0 10px;
+      color: var(--red);
+      font-size: clamp(20px, 3vw, 26px);
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      line-height: 1.2;
+      text-transform: uppercase;
+      text-shadow: 0 0 24px rgba(255, 90, 78, 0.28);
+    }
+
+    .ended-text {
+      margin: 0;
+      color: var(--ink-dim);
+      font-size: 10px;
+      line-height: 1.8;
+    }
+
+    /* ---------- HUD: экипаж и голос ---------- */
+
+    .hud-sep { margin: 0 6px; color: var(--ink-faint); opacity: 0.6; }
+
+    #hud-ping[data-state="ok"] { color: var(--green-dim); }
+    #hud-ping[data-state="warn"] { color: var(--amber); }
+    #hud-ping[data-state="error"] { color: var(--red); }
+
+    .hud-voice {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 2px;
+      padding: 4px 8px;
+      border: 1px solid var(--line-soft);
+      color: var(--ink-faint);
+      font-size: 8px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      transition: color 160ms, border-color 160ms, box-shadow 160ms;
+    }
+
+    .hud-voice i {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.8;
+    }
+
+    .hud-voice[data-state="on"] { color: var(--green-dim); border-color: rgba(185, 247, 164, 0.24); }
+    .hud-voice[data-state="warn"] { color: var(--amber); border-color: rgba(255, 191, 105, 0.26); }
+    .hud-voice[data-state="error"] { color: var(--red); border-color: rgba(255, 90, 78, 0.3); }
+
+    .hud-voice.is-speaking {
+      color: var(--green-strong);
+      border-color: var(--green);
+      box-shadow: 0 0 18px rgba(185, 247, 164, 0.28);
+    }
+
+    .hud-voice.is-speaking i {
+      animation: voice-pulse 0.9s ease-in-out infinite;
+    }
+
+    .hud-voice.is-ptt { color: var(--amber); border-color: rgba(255, 191, 105, 0.55); }
+
+    @keyframes voice-pulse {
+      0%, 100% { transform: scale(1); opacity: 0.75; }
+      50% { transform: scale(1.6); opacity: 1; }
+    }
+
+    /* ---------- Адаптив ---------- */
+
+    @media (max-width: 720px) {
+      .lobby-code-card {
+        grid-template-columns: minmax(0, 1fr) auto;
+        row-gap: 12px;
+      }
+      .lobby-copy { grid-column: 1 / -1; justify-self: stretch; }
+      .lobby-code-value { font-size: clamp(30px, 11vw, 44px); }
+      .lobby-voice-row { flex-direction: column; align-items: flex-start; }
+      .lobby-actions { flex-direction: column-reverse; }
+      .lobby-actions .btn-terminal { width: 100%; }
+      .voice-mode-row { flex-direction: column; align-items: flex-start; gap: 10px; }
+      .roster-row { grid-template-columns: 30px minmax(0, 1fr) auto; }
+      .roster-dot { display: none; }
+    }
+
+    @media (max-width: 480px) {
+      .lobby-screen { padding: 10px; }
+      .roster-row { font-size: 9px; padding: 6px 9px; }
+      .roster-badge { font-size: 7px; }
+    }
+
     @media (max-width: 1080px) {
       .menu-grid {
         gap: 40px;
@@ -2745,7 +3279,7 @@
           </div>
           <div class="manifest-item">
             <span>Пассажиры</span>
-            <strong>01 / ?</strong>
+            <strong>01 / 06</strong>
           </div>
           <div class="manifest-item">
             <span>Связь</span>
@@ -2765,7 +3299,7 @@
               <span class="kicker">СИСТЕМА БИЛЕТИРОВАНИЯ</span>
               <h2 id="menu-title">ГЛАВНОЕ МЕНЮ</h2>
             </div>
-            <span class="panel-code">СБОРКА<br>0.1.0-П1</span>
+            <span class="panel-code">СБОРКА<br>0.2.0-П2</span>
           </div>
 
           <div class="panel-rule" aria-hidden="true"></div>
@@ -2799,10 +3333,11 @@
             </button>
           </nav>
 
-          <div class="panel-status" aria-hidden="true">
+          <div class="panel-status">
             <span><i class="dot dot--blink"></i>СЕТЬ: ОЖИДАНИЕ</span>
             <span class="status-ok">СИСТЕМА // ОНЛАЙН</span>
           </div>
+          <div class="menu-voice" id="menu-voice-status" data-state="off">ГОЛОС: ВЫКЛ</div>
         </div>
       </aside>
     </main>
@@ -2826,7 +3361,7 @@
           <span>ЕСЛИ ВЫ СЛЫШИТЕ СВОЁ ИМЯ — <b>НЕ ОТВЕЧАЙТЕ</b></span>
         </div>
       </div>
-      <div class="footer-build">СБОРКА <b>0.1</b> // ЧАСТЬ I</div>
+      <div class="footer-build">СБОРКА <b>0.2</b> // ЧАСТЬ II</div>
     </footer>
   </section>
 
@@ -2946,8 +3481,9 @@
           </div>
 
           <p class="mic-hint">
-            Запись не ведётся и никуда не передаётся. Браузер запросит разрешение только после нажатия
-            на кнопку. При закрытии настроек проверка автоматически останавливается.
+            Разрешение запрашивается при запуске игры. Проверка ниже включает микрофон только на время
+            настроек и показывает уровень голоса. В вагоне звук передаётся напрямую пассажирам
+            по WebRTC и нигде не записывается.
           </p>
 
           <div class="mic-actions">
@@ -2958,6 +3494,62 @@
           </div>
 
           <p class="form-error" id="mic-error" role="alert" hidden></p>
+        </div>
+
+        <div class="setting-section voice-section">
+          <div class="setting-row">
+            <div class="setting-label">
+              <span class="setting-index" aria-hidden="true">04</span>
+              <div>
+                <h3 id="voice-label">Голосовая связь</h3>
+                <p>Прямой WebRTC-канал между пассажирами. Звук уходит соседям напрямую, без сервера.</p>
+              </div>
+            </div>
+            <div class="setting-control">
+              <label class="switch-line" for="voice-enabled">
+                <input type="checkbox" id="voice-enabled" checked>
+                <span class="switch-ui" aria-hidden="true"></span>
+                <span>Передавать голос</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="voice-mode-row">
+            <span class="voice-mode-label">Режим микрофона</span>
+            <div class="segmented" role="group" aria-label="Режим микрофона">
+              <button type="button" class="segmented-btn is-active" data-voice-mode="open" aria-pressed="true">
+                Открытый
+              </button>
+              <button type="button" class="segmented-btn" data-voice-mode="ptt" aria-pressed="false">
+                Рация · V
+              </button>
+            </div>
+          </div>
+
+          <p class="voice-hint" id="voice-hint">
+            Открытый микрофон: голос передаётся постоянно. Громкость падает с расстоянием —
+            дальше 14 метров эфир полностью глохнет.
+          </p>
+
+          <label class="field-label field-label--spaced" for="callsign">
+            Позывной
+            <span>до 14 символов</span>
+          </label>
+          <input
+            class="text-input"
+            id="callsign"
+            name="callsign"
+            type="text"
+            maxlength="14"
+            autocomplete="off"
+            autocapitalize="characters"
+            spellcheck="false"
+            placeholder="ПАССАЖИР 06"
+          >
+          <p class="voice-hint voice-hint--small">
+            Позывной виден над капсулой и в списке экипажа. Наушники обязательны:
+            микрофон не выключен — эхо собственного голоса неизбежно.
+          </p>
         </div>
 
         <div class="definition-rule" aria-hidden="true">КОНЕЦ СЛУЖЕБНОГО РАЗДЕЛА</div>
@@ -3005,15 +3597,17 @@
             autocomplete="off"
             autocapitalize="characters"
             spellcheck="false"
-            maxlength="7"
-            placeholder="XXXX"
+            maxlength="5"
+            placeholder="XXXXX"
             aria-describedby="lobby-help join-error"
           >
-          <p class="field-help" id="lobby-help">Четырёхзначный код отображается в верхней части экрана у хоста.</p>
+          <p class="field-help" id="lobby-help">
+            Пятизначный код виден на экране лобби у хоста. Действует, пока хост не закроет сеанс.
+          </p>
 
           <div class="notice">
-            <b>ВНИМАНИЕ</b>
-            <span>Сетевой модуль будет установлен во второй части. Сейчас доступен только локальный сеанс через «Создать лобби».</span>
+            <b>ПРЯМОЕ СОЕДИНЕНИЕ</b>
+            <span>Пассажиры связаны напрямую через PeerJS. Голос и координаты не проходят через игровой сервер — только через сигнальный узел.</span>
           </div>
 
           <p class="form-error" id="join-error" role="alert" hidden></p>
@@ -3027,6 +3621,83 @@
     </div>
   </section>
 
+  <!-- ==================== ЛОББИ ==================== -->
+  <section id="lobby-screen" class="screen lobby-screen" hidden aria-labelledby="lobby-title">
+    <div class="lobby-shell panel">
+      <div class="panel-chrome" aria-hidden="true">
+        <i></i><i></i><i></i>
+        <em>СЕТЕВОЙ ТАМБУР // 06</em>
+      </div>
+
+      <div class="modal-body lobby-body">
+        <header class="lobby-head">
+          <div>
+            <span class="kicker">СЕАНС ОТКРЫТ</span>
+            <h2 id="lobby-title">Вагон открыт</h2>
+            <p id="lobby-subtitle">Передайте код экипажу. Как только все будут на месте — входите в салон.</p>
+          </div>
+          <div class="status-chip" id="lobby-status" data-state="pending" role="status" aria-live="polite">
+            <span id="lobby-status-text">УСТАНОВКА СВЯЗИ...</span>
+          </div>
+        </header>
+
+        <div class="lobby-code-card">
+          <div class="lobby-code-label">
+            Код лобби
+            <small>5 символов · латиница и цифры</small>
+          </div>
+          <div class="lobby-code-value" id="lobby-code-value" aria-live="polite">—</div>
+          <button type="button" class="btn-terminal lobby-copy" id="btn-copy-code">Копировать</button>
+        </div>
+
+        <div class="lobby-roster-head">
+          <span>СОСТАВ ЭКИПАЖА</span>
+          <b id="lobby-count" data-state="ok">1 / 6</b>
+        </div>
+        <ul class="roster-list" id="lobby-roster-list" aria-label="Пассажиры лобби"></ul>
+
+        <div class="lobby-voice-row">
+          <span class="status-chip" id="lobby-voice" data-state="off">ГОЛОС: ВЫКЛ</span>
+          <p class="lobby-hint">
+            Голос слышен только рядом: громкость падает с расстоянием и глохнет дальше 14 метров.
+            Над капсулой — позывной и индикатор речи.
+          </p>
+        </div>
+
+        <div class="modal-actions lobby-actions">
+          <button type="button" class="btn-terminal btn-terminal--danger" id="btn-leave-lobby">Покинуть лобби</button>
+          <button type="button" class="btn-terminal btn-terminal--primary" id="btn-enter-car">Войти в салон</button>
+        </div>
+
+        <p class="lobby-footnote">
+          Пока вы в лобби, вагон стоит. Внутри — тёмный салон, курсор захватывается мышью,
+          <kbd>WASD</kbd> — движение, <kbd>SHIFT</kbd> — бег, <kbd>ESC</kbd> — пауза,
+          <kbd>V</kbd> — рация (если выбран режим рации).
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== СЕАНС ЗАВЕРШЁН ==================== -->
+  <section id="modal-ended" class="screen modal-screen" hidden aria-labelledby="ended-title">
+    <div class="modal-shell modal-shell--narrow panel" role="dialog" aria-modal="true" aria-labelledby="ended-title">
+      <div class="panel-chrome" aria-hidden="true">
+        <i></i><i></i><i></i>
+        <em>СИГНАЛ ОБОРВАН // 06</em>
+      </div>
+      <div class="modal-body">
+        <span class="kicker">ЛОББИ БОЛЬШЕ НЕ СУЩЕСТВУЕТ</span>
+        <h2 id="ended-title" class="ended-title">Хост покинул вагон</h2>
+        <p class="ended-text" id="ended-text">
+          Двери захлопнулись, и голос в рации смолк. Вернитесь в меню и подключитесь к новому лобби.
+        </p>
+        <div class="modal-actions">
+          <button type="button" class="btn-terminal btn-terminal--primary" id="btn-ended-menu">В главное меню</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ==================== ИГРОВОЙ HUD ==================== -->
   <div id="hud" class="hud" hidden aria-label="Игровой интерфейс">
     <div class="hud-top hud-top--left">
@@ -3036,7 +3707,15 @@
 
     <div class="hud-top hud-top--right">
       <div class="hud-kicker">СЕАНС // <span id="hud-lobby-code">СОЛО</span></div>
-      <div class="hud-route">РЕЖИМ: <span class="offline">ЛОКАЛЬНЫЙ</span></div>
+      <div class="hud-route">
+        ЭКИПАЖ: <span id="hud-crew">1/6</span>
+        <span class="hud-sep">·</span>
+        ПИНГ: <span id="hud-ping" data-state="idle">— мс</span>
+      </div>
+      <div class="hud-voice" id="hud-voice" data-state="off">
+        <i aria-hidden="true"></i>
+        <span id="hud-voice-text">ГОЛОС: ВЫКЛ</span>
+      </div>
     </div>
 
     <div class="crosshair" aria-hidden="true">
@@ -3070,6 +3749,7 @@
     <div class="hud-hints" id="hud-hints">
       <span><kbd>WASD</kbd> ДВИЖЕНИЕ</span>
       <span><kbd>SHIFT</kbd> БЕГ</span>
+      <span><kbd>V</kbd> РАЦИЯ</span>
       <span><kbd>ESC</kbd> ПАУЗА</span>
     </div>
   </div>
@@ -3093,7 +3773,7 @@
         </div>
 
         <div class="pause-meta">
-          <span>ВАГОН <b>06</b> // СЕАНС <b id="pause-lobby-code">—</b></span>
+          <span>ВАГОН <b>06</b> // СЕАНС <b id="pause-lobby-code">—</b> // ЭКИПАЖ <b id="pause-crew">1/6</b></span>
           <span><kbd>ESC</kbd> ВЕРНУТЬСЯ</span>
         </div>
       </div>
@@ -3151,6 +3831,9 @@
       }, true);
     })();
   </script>
+
+  <!-- PeerJS 1.5.5: сигнализация и WebRTC. UMD-сборка выставляет window.Peer. -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" crossorigin="anonymous"></script>
 
   <script type="module" src="game.js"></script>
 
