@@ -3799,6 +3799,482 @@
         display: none;
       }
     }
+
+    /* ============================================================
+       ЧАСТЬ V — СНАРЯЖЕНИЕ, АВТОМАТ, ПАДЕНИЕ И ГАРДЕРОБ
+       ============================================================ */
+
+    /* ---------- Панель предметов в HUD ---------- */
+
+    .hud-items {
+      position: absolute;
+      right: clamp(18px, 3vw, 42px);
+      /* Выше строки подсказок: она занимает нижние ~70 px и раньше
+         наезжала на слоты снаряжения. */
+      bottom: max(96px, calc(env(safe-area-inset-bottom) + 96px));
+      z-index: 2;
+      display: grid;
+      gap: 5px;
+      width: min(250px, calc(100vw - 56px));
+      animation: hud-slide-up 0.7s 0.35s var(--ease-out) both;
+    }
+
+    .item-slot {
+      display: grid;
+      grid-template-columns: 24px 1fr auto;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 8px;
+      border: 1px solid var(--line-soft);
+      background: rgba(2, 7, 4, 0.58);
+      color: var(--ink-dim);
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      line-height: 1.2;
+      text-transform: uppercase;
+      text-shadow: 0 1px 5px rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(2px);
+      -webkit-backdrop-filter: blur(2px);
+      transition: border-color 140ms, color 140ms, opacity 140ms;
+    }
+
+    .item-slot kbd {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 20px;
+      border: 1px solid rgba(185, 247, 164, 0.32);
+      color: var(--green-strong);
+      font-family: inherit;
+      font-size: 11px;
+    }
+
+    .item-slot b {
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 400;
+      letter-spacing: 0.06em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .item-slot[data-empty="true"] {
+      opacity: 0.38;
+    }
+
+    .item-slot[data-active="true"] {
+      border-color: rgba(185, 247, 164, 0.55);
+      color: var(--ink);
+      box-shadow: 0 0 16px rgba(185, 247, 164, 0.12);
+    }
+
+    .item-slot[data-active="true"] b {
+      color: var(--green-strong);
+    }
+
+    /* ---------- Экран падения ---------- */
+
+    .downed-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 14;
+      display: grid;
+      /* По центру: нижнюю кромку занимает тост «ВЫ ПАЛИ // ОН ИДЁТ ДАЛЬШЕ»,
+         и раньше он перекрывал подсказку и таймер. */
+      place-items: center;
+      padding: 0 20px;
+      pointer-events: none;
+      background:
+        radial-gradient(ellipse at 50% 62%, transparent 22%, rgba(58, 4, 2, 0.5) 68%, rgba(16, 1, 1, 0.85) 100%);
+      animation: downed-in 260ms ease both;
+    }
+
+    .downed-overlay[hidden] {
+      display: none;
+    }
+
+    @keyframes downed-in {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .downed-card {
+      width: min(560px, 100%);
+      padding: 16px 22px 18px;
+      border: 1px solid rgba(255, 90, 78, 0.45);
+      background: rgba(14, 4, 3, 0.9);
+      box-shadow: 0 0 48px rgba(255, 60, 40, 0.18);
+      text-align: center;
+    }
+
+    .downed-card .kicker {
+      color: rgba(255, 160, 148, 0.8);
+      font-size: 10px;
+    }
+
+    .downed-card h2 {
+      margin: 4px 0 8px;
+      color: #ffd8d3;
+      font-size: clamp(24px, 4vw, 34px);
+      font-weight: 400;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    .downed-card p {
+      margin: 0 0 8px;
+      color: #e8b6ae;
+      font-size: 14px;
+      line-height: 1.55;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .downed-timer {
+      display: block;
+      color: var(--red);
+      font-size: 13px;
+      letter-spacing: 0.16em;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ---------- Торговый автомат ---------- */
+
+    .shop-shell {
+      width: min(700px, 100%);
+    }
+
+    .shop-wallet {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin: 0 0 16px;
+      padding: 9px 12px;
+      border: 1px solid var(--line-soft);
+      background: rgba(2, 8, 5, 0.55);
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .shop-wallet b {
+      color: var(--amber);
+      font-size: 18px;
+      font-weight: 400;
+      letter-spacing: 0.06em;
+    }
+
+    .shop-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .shop-item {
+      display: grid;
+      /* minmax(0, 1fr) не даёт описанию залезть под цену: иначе
+         длинные слова вроде «ОДНОРАЗОВЫЙ» распирают колонку. */
+      grid-template-columns: 44px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      padding: 12px;
+      border: 1px solid var(--line-soft);
+      background: rgba(2, 8, 5, 0.62);
+      color: var(--ink);
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 140ms, background 140ms, transform 140ms;
+    }
+
+    .shop-item:hover,
+    .shop-item:focus-visible {
+      border-color: var(--line-strong);
+      background: rgba(22, 42, 27, 0.55);
+    }
+
+    .shop-item:active {
+      transform: translateY(1px);
+    }
+
+    .shop-icon svg {
+      width: 22px;
+      height: 22px;
+    }
+
+    .shop-icon {
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      border: 1px solid var(--line-soft);
+      background: rgba(0, 0, 0, 0.28);
+      color: var(--green);
+      font-size: 20px;
+      line-height: 1;
+    }
+
+    .shop-copy {
+      display: block;
+      min-width: 0;
+    }
+
+    .shop-copy b {
+      display: block;
+      font-size: 14px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .shop-copy small {
+      display: block;
+      margin-top: 3px;
+      color: var(--ink-faint);
+      font-size: 10px;
+      line-height: 1.5;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .shop-price {
+      color: var(--amber);
+      font-size: 15px;
+      font-weight: 400;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .shop-price small {
+      display: block;
+      margin-top: 3px;
+      color: var(--ink-faint);
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-align: right;
+    }
+
+    .shop-note {
+      margin: 14px 0 0;
+      color: var(--ink-faint);
+      font-size: 11px;
+      line-height: 1.7;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .shop-foot {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 18px;
+    }
+
+    /* ---------- Гардероб ---------- */
+
+    .wardrobe-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 41;
+      display: grid;
+      grid-template-columns: 1fr minmax(360px, 560px);
+      gap: 24px;
+      align-items: center;
+      padding: 20px;
+      background: linear-gradient(
+        90deg,
+        rgba(2, 4, 3, 0.05) 0%,
+        rgba(2, 4, 3, 0.22) 34%,
+        rgba(2, 4, 3, 0.72) 54%,
+        rgba(2, 4, 3, 0.94) 72%
+      );
+    }
+
+    .wardrobe-screen[hidden] {
+      display: none;
+    }
+
+    .wardrobe-hint {
+      align-self: start;
+      justify-self: start;
+      max-width: 300px;
+      padding: 9vh 0 0 3vw;
+      color: var(--ink-faint);
+      font-size: 11px;
+      line-height: 1.8;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      text-shadow: 0 1px 8px #000;
+    }
+
+    .wardrobe-hint b {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--green-strong);
+      font-weight: 500;
+    }
+
+    .wardrobe-shell {
+      width: 100%;
+      max-height: min(90vh, 880px);
+    }
+
+    .skin-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .skin-card {
+      display: block;
+      padding: 10px 12px;
+      border: 1px solid var(--line-soft);
+      background: rgba(2, 7, 4, 0.62);
+      color: var(--ink-dim);
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 140ms, background 140ms, color 140ms;
+    }
+
+    .skin-card:hover,
+    .skin-card:focus-visible {
+      border-color: var(--line);
+      color: var(--ink);
+    }
+
+    .skin-card[aria-pressed="true"] {
+      border-color: var(--line-strong);
+      background: rgba(20, 40, 25, 0.58);
+      color: var(--ink);
+      box-shadow: inset 0 0 0 1px rgba(185, 247, 164, 0.18);
+    }
+
+    .skin-card b {
+      display: block;
+      margin-top: 7px;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .skin-card small {
+      display: block;
+      margin-top: 3px;
+      color: var(--ink-faint);
+      font-size: 9px;
+      line-height: 1.45;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .skin-swatch {
+      display: block;
+      height: 26px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      background: linear-gradient(120deg, #46553c, #2c3726 62%, #d8bb9b);
+    }
+
+    .skin-card[data-skin="schoolgirl"] .skin-swatch {
+      background: linear-gradient(120deg, #39466e, #f4f6fa 58%, #232941);
+    }
+
+    .skin-card[data-skin="furry"] .skin-swatch {
+      background: linear-gradient(120deg, #b47d47, #e8d4b4 55%, #8d5f34);
+    }
+
+    .skin-card[data-skin="tv"] .skin-swatch {
+      background:
+        repeating-linear-gradient(90deg, rgba(155, 227, 220, 0.5) 0 2px, transparent 2px 5px),
+        linear-gradient(120deg, #3d4457, #191d26);
+    }
+
+    .skin-card[data-skin="engineer"] .skin-swatch {
+      background: linear-gradient(120deg, #49637a, #263140 58%, #c99d78);
+    }
+
+    .skin-card[data-skin="inspector"] .skin-swatch {
+      background: linear-gradient(120deg, #3d3024, #1c1611 62%, #ded3c2);
+    }
+
+    .skin-accents {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 16px 0 18px;
+      color: var(--ink-faint);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .skin-accents > span {
+      margin-right: 4px;
+    }
+
+    .accent-dot {
+      width: 26px;
+      height: 26px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      background: var(--accent);
+      cursor: pointer;
+      transition: box-shadow 140ms, transform 140ms;
+    }
+
+    .accent-dot:hover {
+      transform: translateY(-1px);
+    }
+
+    .accent-dot[aria-pressed="true"] {
+      box-shadow: 0 0 0 1px var(--green-strong), 0 0 16px var(--accent);
+    }
+
+    .wardrobe-foot {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    @media (max-width: 900px) {
+      .wardrobe-screen {
+        grid-template-columns: 1fr;
+        gap: 0;
+        background: rgba(2, 4, 3, 0.9);
+      }
+
+      .wardrobe-hint {
+        display: none;
+      }
+
+      .wardrobe-shell {
+        justify-self: center;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .hud-items {
+        right: 12px;
+        bottom: 84px;
+        width: min(200px, 48vw);
+      }
+
+      .item-slot {
+        font-size: 10px;
+        grid-template-columns: 22px 1fr auto;
+      }
+
+      .shop-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .skin-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
   </style>
 </head>
 
@@ -3916,7 +4392,7 @@
               <span class="kicker">СИСТЕМА БИЛЕТИРОВАНИЯ</span>
               <h2 id="menu-title">ГЛАВНОЕ МЕНЮ</h2>
             </div>
-            <span class="panel-code">СБОРКА<br>0.3.0-П3</span>
+            <span class="panel-code">СБОРКА<br>0.5.0-П5</span>
           </div>
 
           <div class="panel-rule" aria-hidden="true"></div>
@@ -3945,6 +4421,15 @@
               <span class="menu-btn-copy">
                 <span class="menu-btn-label">Настройки</span>
                 <span class="menu-btn-note">Громкость, микрофон, управление</span>
+              </span>
+              <span class="menu-btn-arrow" aria-hidden="true">→</span>
+            </button>
+
+            <button type="button" class="menu-btn" id="btn-wardrobe">
+              <span class="menu-btn-index" aria-hidden="true">04</span>
+              <span class="menu-btn-copy">
+                <span class="menu-btn-label">Гардероб</span>
+                <span class="menu-btn-note">Образ проводника и подсветка</span>
               </span>
               <span class="menu-btn-arrow" aria-hidden="true">→</span>
             </button>
@@ -3978,7 +4463,7 @@
           <span>ЕСЛИ ВЫ СЛЫШИТЕ СВОЁ ИМЯ — <b>НЕ ОТВЕЧАЙТЕ</b></span>
         </div>
       </div>
-      <div class="footer-build">СБОРКА <b>0.4</b> // ЧАСТЬ IV</div>
+      <div class="footer-build">СБОРКА <b>0.5</b> // ЧАСТЬ V</div>
     </footer>
   </section>
 
@@ -4384,6 +4869,169 @@
     </div>
   </section>
 
+  <!-- ==================== ТОРГОВЫЙ АВТОМАТ ==================== -->
+  <section id="modal-shop" class="screen modal-screen" hidden aria-labelledby="shop-title">
+    <div class="modal-shell panel shop-shell" role="dialog" aria-modal="true" aria-labelledby="shop-title">
+      <div class="panel-chrome" aria-hidden="true">
+        <i></i><i></i><i></i>
+        <em>АВТОМАТ // ТАМБУР 06</em>
+      </div>
+
+      <div class="modal-body">
+        <header class="modal-header">
+          <div>
+            <span class="kicker">СНАРЯЖЕНИЕ ПРОВОДНИКА</span>
+            <h2 id="shop-title">Торговый автомат</h2>
+            <p>Валюта пока бесконечная — берите, сколько унесёте</p>
+          </div>
+          <button type="button" class="icon-button" id="btn-shop-close" aria-label="Закрыть автомат">×</button>
+        </header>
+
+        <div class="shop-wallet">
+          <span>КРЕДИТ ПРОВОДНИКА</span>
+          <b>∞ ₽</b>
+        </div>
+
+        <div class="shop-grid" id="shop-grid">
+          <button type="button" class="shop-item" data-buy="flashlight">
+            <span class="shop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                <path d="M12 2.8l7 4v10.4l-7 4-7-4V6.8z" />
+                <path d="M12 8.2v7.6" />
+                <path d="M9.4 10h5.2" />
+              </svg>
+            </span>
+            <span class="shop-copy">
+              <b>Фонарик</b>
+              <small>Луч света в темноте. Клавиша F</small>
+            </span>
+            <span class="shop-price">150 ₽<small>ВЕЧНЫЙ</small></span>
+          </button>
+
+          <button type="button" class="shop-item" data-buy="bandage">
+            <span class="shop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <path d="M9 4.5h6v4.5H19.5v6H15v4.5H9V15H4.5V9H9z" />
+              </svg>
+            </span>
+            <span class="shop-copy">
+              <b>Бинт</b>
+              <small>Одноразовый. Поднимает вас или напарника. Клавиша 1</small>
+            </span>
+            <span class="shop-price">400 ₽<small>1 ШТ</small></span>
+          </button>
+
+          <button type="button" class="shop-item" data-buy="taser">
+            <span class="shop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round">
+                <path d="M13.5 2.5L5.5 13.2h5.2l-1.2 8.3 8.5-11.3h-5.1z" />
+              </svg>
+            </span>
+            <span class="shop-copy">
+              <b>Шокер</b>
+              <small>3 заряда, перезарядка 20 с. Роняет его на 8 с. Клавиша 2</small>
+            </span>
+            <span class="shop-price">300 ₽<small>3 ЗАРЯДА</small></span>
+          </button>
+
+          <button type="button" class="shop-item" data-buy="rope">
+            <span class="shop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+                <path d="M7.2 8.4c-2 0-3.4 1.6-3.4 3.6s1.4 3.6 3.4 3.6c3.6 0 5.2-7.2 8.8-7.2 2 0 3.4 1.6 3.4 3.6s-1.4 3.6-3.4 3.6c-3.6 0-5.2-7.2-8.8-7.2z" />
+              </svg>
+            </span>
+            <span class="shop-copy">
+              <b>Верёвка</b>
+              <small>+32 с на переноску бессознательного тела. Клавиша 3</small>
+            </span>
+            <span class="shop-price">220 ₽<small>1 ШТ</small></span>
+          </button>
+        </div>
+
+        <p class="shop-note">
+          Нажмите на карточку, чтобы купить. Покупка сразу падает в карманы:
+          фонарик горит поверх, бинт, шокер и верёвка применяются по клавише.
+        </p>
+
+        <div class="shop-foot">
+          <button type="button" class="btn-terminal btn-terminal--primary" id="btn-shop-done">ЗАКРЫТЬ</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== ГАРДЕРОБ ==================== -->
+  <section id="modal-wardrobe" class="wardrobe-screen" hidden aria-labelledby="wardrobe-title">
+    <div class="wardrobe-hint">
+      <b>ПРЕДПРОСМОТР</b>
+      Так вас видят остальные в вагоне. Модель повёрнута к вам лицом.
+    </div>
+
+    <div class="modal-shell panel wardrobe-shell" role="dialog" aria-modal="true" aria-labelledby="wardrobe-title">
+      <div class="panel-chrome" aria-hidden="true">
+        <i></i><i></i><i></i>
+        <em>ГАРДЕРОБ // 06</em>
+      </div>
+
+      <div class="modal-body">
+        <header class="modal-header">
+          <div>
+            <span class="kicker">ВНЕШНОСТЬ ПРОВОДНИКА</span>
+            <h2 id="wardrobe-title">Гардероб</h2>
+            <p>Образ и цвет подсветки сохраняются в браузере</p>
+          </div>
+          <button type="button" class="icon-button" id="btn-wardrobe-close" aria-label="Закрыть гардероб">×</button>
+        </header>
+
+        <div class="skin-grid" id="skin-grid">
+          <button type="button" class="skin-card" data-skin="conductor" aria-pressed="true">
+            <span class="skin-swatch" aria-hidden="true"></span>
+            <b>Проводник</b>
+            <small>Фуражка, китель, погоны</small>
+          </button>
+          <button type="button" class="skin-card" data-skin="schoolgirl" aria-pressed="false">
+            <span class="skin-swatch" aria-hidden="true"></span>
+            <b>Школьница</b>
+            <small>Матроска и плиссированная юбка</small>
+          </button>
+          <button type="button" class="skin-card" data-skin="furry" aria-pressed="false">
+            <span class="skin-swatch" aria-hidden="true"></span>
+            <b>Фури</b>
+            <small>Лисьи уши, хвост и лапы</small>
+          </button>
+          <button type="button" class="skin-card" data-skin="tv" aria-pressed="false">
+            <span class="skin-swatch" aria-hidden="true"></span>
+            <b>Телевизор</b>
+            <small>Корпус на голове, шумящий экран</small>
+          </button>
+          <button type="button" class="skin-card" data-skin="engineer" aria-pressed="false">
+            <span class="skin-swatch" aria-hidden="true"></span>
+            <b>Машинист</b>
+            <small>Каска, спецовка, лампа</small>
+          </button>
+          <button type="button" class="skin-card" data-skin="inspector" aria-pressed="false">
+            <span class="skin-swatch" aria-hidden="true"></span>
+            <b>Ревизор</b>
+            <small>Кожаное пальто и керосинка</small>
+          </button>
+        </div>
+
+        <div class="skin-accents" id="skin-accents">
+          <span>Подсветка</span>
+          <button type="button" class="accent-dot" data-accent="0" style="--accent:#9be3dc" aria-label="Бирюзовая подсветка" aria-pressed="true"></button>
+          <button type="button" class="accent-dot" data-accent="1" style="--accent:#b9f7a4" aria-label="Зелёная подсветка" aria-pressed="false"></button>
+          <button type="button" class="accent-dot" data-accent="2" style="--accent:#ff6a4a" aria-label="Красная подсветка" aria-pressed="false"></button>
+          <button type="button" class="accent-dot" data-accent="3" style="--accent:#c9a0ff" aria-label="Лиловая подсветка" aria-pressed="false"></button>
+        </div>
+
+        <div class="wardrobe-foot">
+          <button type="button" class="btn-terminal" id="btn-skin-random">СЛУЧАЙНЫЙ ОБРАЗ</button>
+          <button type="button" class="btn-terminal btn-terminal--primary" id="btn-wardrobe-done">ГОТОВО</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <!-- ==================== ИГРОВОЙ HUD ==================== -->
   <div id="hud" class="hud" hidden aria-label="Игровой интерфейс">
     <div class="hud-top hud-top--left">
@@ -4450,9 +5098,46 @@
     <div class="hud-hints" id="hud-hints">
       <span><kbd>WASD</kbd> ДВИЖЕНИЕ</span>
       <span><kbd>SHIFT</kbd> БЕГ</span>
-      <span><kbd>E</kbd> ПРОВЕРИТЬ / СХВАТИТЬ</span>
+      <span><kbd>E</kbd> ДВЕРИ / ЗАХВАТ</span>
+      <span><kbd>F</kbd> ФОНАРИК</span>
+      <span><kbd>1</kbd> БИНТ</span>
+      <span><kbd>2</kbd> ШОКЕР</span>
+      <span><kbd>3</kbd> ВЕРЁВКА</span>
       <span><kbd>V</kbd> РАЦИЯ</span>
       <span><kbd>ESC</kbd> ПАУЗА</span>
+    </div>
+
+    <div class="hud-items" id="hud-items" aria-label="Снаряжение">
+      <div class="item-slot" data-slot="flashlight" data-empty="true" data-active="false">
+        <kbd>F</kbd>
+        <span>ФОНАРИК</span>
+        <b id="slot-flashlight">НЕТ</b>
+      </div>
+      <div class="item-slot" data-slot="bandage" data-empty="true">
+        <kbd>1</kbd>
+        <span>БИНТ</span>
+        <b id="slot-bandage">0</b>
+      </div>
+      <div class="item-slot" data-slot="taser" data-empty="true">
+        <kbd>2</kbd>
+        <span>ШОКЕР</span>
+        <b id="slot-taser">0</b>
+      </div>
+      <div class="item-slot" data-slot="rope" data-empty="true">
+        <kbd>3</kbd>
+        <span>ВЕРЁВКА</span>
+        <b id="slot-rope">0</b>
+      </div>
+    </div>
+  </div>
+
+  <!-- Падение: камера у пола, напарник может поднять бинтом -->
+  <div class="downed-overlay" id="downed-overlay" hidden aria-live="assertive">
+    <div class="downed-card">
+      <span class="kicker">СИГНАЛ ПРОВОДНИКА // ПОТЕРЯН</span>
+      <h2>ВЫ ПАЛИ</h2>
+      <p id="downed-hint">НАПАРНИК МОЖЕТ ПОДНЯТЬ ВАС БИНТОМ</p>
+      <span class="downed-timer" id="downed-timer"></span>
     </div>
   </div>
 
@@ -4479,13 +5164,19 @@
       <ol>
         <li>Вы — проводник. Проверьте билеты у <b>четырёх пассажиров</b> в салоне: наведите прицел и нажмите <b>E</b>.</li>
         <li>Пятый пассажир сидит у окна на месте <b>05</b>. Билета у него нет. Не будите его без нужды.</li>
-        <li>Если он проснётся — <b>бегите в соседний вагон</b> (дверь в конце салона) и сорвите тормозной кран.</li>
+        <li>Проснётся — бейте <b>шокером (2)</b>: он падает на 8 секунд. <b>Верёвка (3)</b> даёт ещё 32 секунды, <b>бинт (1)</b> поднимает вас или напарника.</li>
+        <li>Дотащите тело в <b>тамбур</b> (дверь в конце салона), встаньте у левого борта и удерживайте <b>E</b>, чтобы сбросить его с поезда.</li>
+        <li>В тамбуре стоит <b>автомат</b>: фонарик, бинты, шокер, верёвка. Деньги бесконечные — берите всё.</li>
         <li>Свет погаснет. Держитесь подальше: одно касание — и смена окончена.</li>
       </ol>
       <div class="briefing-keys">
         <span><kbd>WASD</kbd> идти</span>
         <span><kbd>SHIFT</kbd> бежать</span>
         <span><kbd>E</kbd> взаимодействие</span>
+        <span><kbd>F</kbd> фонарик</span>
+        <span><kbd>1</kbd> бинт</span>
+        <span><kbd>2</kbd> шокер</span>
+        <span><kbd>3</kbd> верёвка</span>
         <span><kbd>V</kbd> рация</span>
         <span><kbd>ESC</kbd> пауза</span>
       </div>
