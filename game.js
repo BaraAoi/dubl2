@@ -1,5 +1,5 @@
 /* ============================================================================
-   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть II
+   ПОЛУНОЧНЫЙ ЭКСПРЕСС — Часть III
    ----------------------------------------------------------------------------
    Единый ES-модуль игры (ванильный JS + Three.js r161 + PeerJS 1.5).
    index.html содержит CSS и DOM; этот файл — вся логика:
@@ -13,6 +13,9 @@
      NetworkManager    — PeerJS: лобби, роутинг данных, heartbeat, реконнект
      RemotePlayers     — капсулы удалённых игроков, nametag, интерполяция
      VoiceChat         — WebRTC-голос, позиционное аудио, «рация»
+     PassengerNPC      — сидящий пассажир, позы и «кровавые» материалы
+     VoiceWatcher      — распознавание ru-RU и детектор крика
+     DemonDirector     — пробуждение, погоня, захват и Game Over
      UIManager         — экраны, HUD, настройки, микрофон
      Game              — сборка и жизненный цикл
    ========================================================================== */
@@ -26,8 +29,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 // =============================================================================
 
 const CONFIG = {
-  version: '0.2.1',
-  part: 2,
+  version: '0.3.0',
+  part: 3,
   car: {
     width: 3.8,          // внутренняя ширина
     length: 32,          // внутренняя длина
@@ -125,6 +128,38 @@ const CONFIG = {
     fadeEnd: 14,
     nametagDistance: 22,
     radioGain: 0.9,
+  },
+  // ---------------------------------------------------------------------
+  // Часть III. «Пассажир», который едет в вагоне.
+  // ---------------------------------------------------------------------
+  npc: {
+    // Сиденье у левой стены: скамья z=3.2…6.7, сиденье на высоте ~0.47 м.
+    seat: { x: -1.44, y: 0.47, z: 5.55 },
+    lookDistance: 4.4,
+    grabDistance: 3.0,
+    // Волочение тяжёлого тела: доля обычной скорости.
+    dragScale: 0.34,
+    dragOffset: 0.92,
+    dragLerp: 9.5,
+    // Сколько секунд тело остаётся обмякшим после захвата.
+    stunTime: 6.0,
+  },
+  demon: {
+    huntSpeed: 4.15,
+    wakeDelay: 1.3,
+    killDistance: 0.92,
+    aisleX: 0.05,
+    bodyRadius: 0.3,
+    standTime: 0.9,
+    stateInterval: 0.05,
+  },
+  speech: {
+    lang: 'ru-RU',
+    keywords: ['демон', 'бежим', 'шокер', 'шесть пальцев'],
+    screamLevel: 0.66,
+    screamHold: 0.14,
+    screamCooldown: 9000,
+    restartDelay: 700,
   },
 };
 
@@ -515,6 +550,81 @@ class AudioManager {
     gain.connect(this.sfx);
     source.start(now);
     source.stop(now + 0.8);
+  }
+
+  /**
+   * Визг «пассажира», когда тот сбрасывает личину.
+   * Ни одного сэмпла: расстроенная пила + шумовой всплеск + низкий удар.
+   */
+  screech() {
+    if (!this.ctx || this.ctx.state !== 'running') return;
+    const now = this.ctx.currentTime;
+    const out = this.ctx.createGain();
+    out.gain.setValueAtTime(0.0001, now);
+    out.gain.exponentialRampToValueAtTime(0.42, now + 0.04);
+    out.gain.exponentialRampToValueAtTime(0.0001, now + 1.75);
+    out.connect(this.sfx);
+
+    // Кластер расстроенных осцилляторов: «человеческий» визг из гармоник.
+    const partials = [1170, 1480, 1760, 2340];
+    partials.forEach((frequency, index) => {
+      const osc = this.ctx.createOscillator();
+      osc.type = index % 2 === 0 ? 'sawtooth' : 'square';
+      osc.frequency.setValueAtTime(frequency, now);
+      osc.frequency.exponentialRampToValueAtTime(
+        frequency * (0.38 + index * 0.05),
+        now + 1.3,
+      );
+      const vibrato = this.ctx.createOscillator();
+      vibrato.type = 'sine';
+      vibrato.frequency.value = 17 + index * 3.5;
+      const vibratoGain = this.ctx.createGain();
+      vibratoGain.gain.value = 26 + index * 8;
+      vibrato.connect(vibratoGain);
+      const gain = this.ctx.createGain();
+      gain.gain.setValueAtTime(0.12 / Math.sqrt(index + 1), now);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.55);
+      vibratoGain.connect(osc.frequency);
+      osc.connect(gain);
+      gain.connect(out);
+      vibrato.start(now);
+      osc.start(now);
+      vibrato.stop(now + 1.6);
+      osc.stop(now + 1.6);
+    });
+
+    // Шумовой выдох с падающей полосой — «дыхание» твари.
+    if (this._whiteNoise) {
+      const noise = this.ctx.createBufferSource();
+      noise.buffer = this._whiteNoise;
+      const band = this.ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.Q.value = 1.7;
+      band.frequency.setValueAtTime(2800, now);
+      band.frequency.exponentialRampToValueAtTime(360, now + 1.15);
+      const noiseGain = this.ctx.createGain();
+      noiseGain.gain.setValueAtTime(0.22, now);
+      noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + 1.35);
+      noise.connect(band);
+      band.connect(noiseGain);
+      noiseGain.connect(out);
+      noise.start(now);
+      noise.stop(now + 1.4);
+    }
+
+    // Низкий удар: слышно телом, а не ушами.
+    const sub = this.ctx.createOscillator();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(78, now);
+    sub.frequency.exponentialRampToValueAtTime(34, now + 0.9);
+    const subGain = this.ctx.createGain();
+    subGain.gain.setValueAtTime(0.0001, now);
+    subGain.gain.exponentialRampToValueAtTime(0.3, now + 0.03);
+    subGain.gain.exponentialRampToValueAtTime(0.0001, now + 1.15);
+    sub.connect(subGain);
+    subGain.connect(this.sfx);
+    sub.start(now);
+    sub.stop(now + 1.2);
   }
 
   update(dt) {
@@ -1710,6 +1820,9 @@ class TrainCar {
     this._flickerTimer = randomRange(2.2, 5.5);
     this._flickerBurst = 0;
     this.dread = 0;
+    // Аварийное отключение света (Часть III).
+    this.blackout = 0;
+    this.blackoutTarget = 0;
 
     this.textures = new TextureFactory(renderer);
     this.materials = this._createMaterials();
@@ -1746,6 +1859,7 @@ class TrainCar {
       roughness: 0.6,
       metalness: 0.05,
     });
+    this.lampSideMaterial = lampSideMaterial;
 
     return {
       floor: new THREE.MeshStandardMaterial({
@@ -3101,6 +3215,11 @@ class TrainCar {
     this.dread = clamp(amount, 0, 1);
   }
 
+  /** Гасит основной свет и оставляет только красную аварийную лампу. */
+  setBlackout(on) {
+    this.blackoutTarget = on ? 1 : 0;
+  }
+
   update(dt, elapsed) {
     // Мерцание главной лампы.
     if (this.reducedMotion) {
@@ -3128,16 +3247,43 @@ class TrainCar {
     }
 
     const dread = this.dread || 0;
+    this.blackout = damp(this.blackout, this.blackoutTarget, 3.4, dt);
+    const power = 1 - clamp(this.blackout, 0, 1);
+
     if (this.centralLight) {
-      this.centralLight.intensity = this.centralBaseIntensity * this._flickerValue * (1 - dread * 0.52);
+      this.centralLight.intensity = this.centralBaseIntensity
+        * this._flickerValue * (1 - dread * 0.52) * power;
     }
     if (this.lampMainMaterial) {
-      this.lampMainMaterial.emissiveIntensity = (0.75 + 1.35 * this._flickerValue) * (1 - dread * 0.55);
+      this.lampMainMaterial.emissiveIntensity = (0.75 + 1.35 * this._flickerValue)
+        * (1 - dread * 0.55) * power;
+    }
+    if (this.lampSideMaterial) {
+      // Плафоны боковых ламп тоже гаснут: иначе в темноте остаются
+      // светящиеся прямоугольники, и «отключение света» не читается.
+      this.lampSideMaterial.emissiveIntensity = 0.55 * power;
     }
     if (this.sideLights) {
       for (const light of this.sideLights) {
-        light.intensity = 7.4 * (1 - dread * 0.6);
+        light.intensity = 7.4 * (1 - dread * 0.6) * power;
       }
+    }
+    if (this.fillLights) {
+      for (const light of this.fillLights) {
+        light.intensity = 2.4 * power * (1 - dread * 0.55);
+      }
+    }
+    if (this.hemiLight) {
+      this.hemiLight.intensity = 0.46 * (0.1 + 0.9 * power);
+    }
+    if (this.exitLight) this.exitLight.intensity = 1.5 * (0.15 + 0.85 * power);
+    if (this.aisleFill) this.aisleFill.intensity = 1.4 * power;
+    if (this.emergencyLight) {
+      // Красная лампа тамбура — единственный источник после отключения.
+      // Дыхание заложено в саму формулу, без второго слагаемого ниже:
+      // иначе пульсация «съедает» лампу почти до нуля.
+      this.emergencyLight.intensity = 3.2 * power
+        + this.blackout * (1.9 + Math.sin(elapsed * 8.5) * 0.35);
     }
 
     // Дождь на стёклах (общая текстура всех окон).
@@ -3172,14 +3318,6 @@ class TrainCar {
       points.geometry.attributes.position.needsUpdate = true;
     }
 
-    if (this.fillLights) {
-      for (const light of this.fillLights) light.intensity = 2.4 * (1 - dread * 0.55);
-    }
-
-    // Лёгкое «дыхание» аварийного света.
-    if (this.emergencyLight) {
-      this.emergencyLight.intensity = 2.9 + Math.sin(elapsed * 2.1) * 0.35;
-    }
   }
 }
 
@@ -3208,6 +3346,10 @@ class PlayerController {
     this.grounded = true;
 
     this.enabled = false;
+    // Волочение тела и прочие эффекты масштабируют скорость, не трогая настройки.
+    this.speedScale = 1;
+    // E — взаимодействие с пассажиром: нажатие и удержание.
+    this.interactHeld = false;
     this.stamina = CONFIG.player.staminaMax;
     this.exhausted = false;
     this.sprinting = false;
@@ -3275,6 +3417,8 @@ class PlayerController {
     this.bobAmount = 0;
     this.stepAccumulator = 0;
     this.regenDelay = 0;
+    this.speedScale = 1;
+    this._releaseInteract();
     this.camera.fov = CONFIG.camera.fov;
     this.camera.updateProjectionMatrix();
     this.camera.rotation.set(0, 0, 0, 'YXZ');
@@ -3288,12 +3432,24 @@ class PlayerController {
       this.keys.clear();
       this.sprinting = false;
       this.velocity.set(0, 0, 0);
+      this._releaseInteract();
     }
+  }
+
+  _releaseInteract() {
+    if (!this.interactHeld) return;
+    this.interactHeld = false;
+    this.bus.emit('player:interact', { held: false });
   }
 
   setSensitivity(value) {
     this.sensitivity = clamp(Number(value) || 1, 0.3, 2.2);
     this.controls.pointerSpeed = this.sensitivity;
+  }
+
+  /** 1 — обычная скорость, 0.34 — тянешь тяжёлое тело. */
+  setSpeedScale(value) {
+    this.speedScale = clamp(Number(value) || 1, 0.15, 1);
   }
 
   lock() {
@@ -3311,17 +3467,30 @@ class PlayerController {
   _onKeyDown(event) {
     if (!this.enabled) return;
     if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.code === 'KeyE') {
+      event.preventDefault();
+      if (!event.repeat && !this.interactHeld) {
+        this.interactHeld = true;
+        this.bus.emit('player:interact', { held: true });
+      }
+      return;
+    }
     if (!this._moveCodes.has(event.code)) return;
     event.preventDefault();
     this.keys.add(event.code);
   }
 
   _onKeyUp(event) {
+    if (event.code === 'KeyE') {
+      this._releaseInteract();
+      return;
+    }
     this.keys.delete(event.code);
   }
 
   _onBlur() {
     this.keys.clear();
+    this._releaseInteract();
   }
 
   _isBlocked(x, z) {
@@ -3394,7 +3563,8 @@ class PlayerController {
     const wish = this._wishDirection(forward, right);
     const moving = wish.lengthSq() > 0.001;
     const shiftHeld = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
-    const wantsSprint = shiftHeld && moving && !this.exhausted && this.stamina > 0;
+    const wantsSprint = shiftHeld && moving && !this.exhausted && this.stamina > 0
+      && this.speedScale > 0.7;
 
     // --- Выносливость ---
     if (wantsSprint) {
@@ -3421,7 +3591,8 @@ class PlayerController {
     this.sprinting = wantsSprint;
 
     // --- Движение ---
-    const speed = wantsSprint ? CONFIG.player.sprintSpeed : CONFIG.player.walkSpeed;
+    const speed = (wantsSprint ? CONFIG.player.sprintSpeed : CONFIG.player.walkSpeed)
+      * this.speedScale;
     const targetX = wish.x * speed;
     const targetZ = wish.z * speed;
     const lambda = moving ? CONFIG.player.acceleration : 11;
@@ -4851,6 +5022,23 @@ class NetworkManager {
     this._broadcast({ t: 'roster', players: this._rosterArray(), hostId: this.selfId });
   }
 
+  /**
+   * Часть III: события «пассажира». Хост рассылает всем, гость — только хосту.
+   * Виды: wake (проснулся), state (позиция), kill (кого достал).
+   */
+  sendDemon(payload, targetId = null) {
+    if (!this.isActive || !payload) return false;
+    if (this.isHost) {
+      if (targetId) {
+        const conn = this.connections.get(targetId);
+        return conn ? this._send(conn, { t: 'demon', ...payload }) : false;
+      }
+      this._broadcast({ t: 'demon', ...payload });
+      return true;
+    }
+    return this._hostConn ? this._send(this._hostConn, { t: 'demon', ...payload }) : false;
+  }
+
   _onData(conn, data) {
     if (!data || typeof data !== 'object' || typeof data.t !== 'string') return;
     const fromId = conn.peer;
@@ -4903,6 +5091,10 @@ class NetworkManager {
         this._dropConnection(fromId, 'bye');
         break;
       }
+      case 'demon': {
+        this.bus.emit('network:demon', { ...data, from: fromId });
+        break;
+      }
       default:
         break;
     }
@@ -4951,6 +5143,10 @@ class NetworkManager {
       }
       case 'close': {
         this._failSession(data.reason || 'host-left');
+        break;
+      }
+      case 'demon': {
+        this.bus.emit('network:demon', { ...data, from: fromId });
         break;
       }
       default:
@@ -5726,6 +5922,10 @@ class VoiceChat {
     this.pttHeld = false;
 
     this.localStream = null;
+    // Наружу уходит отдельный поток с гейтом: сырой микрофон остаётся
+    // живым для анализатора крика и распознавания речи даже в режиме рации.
+    this.outgoingStream = null;
+    this._outgoing = null;
     this.localAnalyser = null;
     this.localSpeaking = false;
     this.localLevel = 0;
@@ -5892,9 +6092,11 @@ class VoiceChat {
     try {
       const result = await this.audio.acquireMic('voice');
       this.localStream = result.stream;
+      this._buildOutgoing();
       this._applyTrackState();
+      const outgoing = this.outgoingStream || this.localStream;
       if (this.network && this.network.publishVoiceStream) {
-        this.network.publishVoiceStream(this.localStream);
+        this.network.publishVoiceStream(outgoing);
       }
       this._emitStatus(true);
       return this.localStream;
@@ -5906,10 +6108,56 @@ class VoiceChat {
     }
   }
 
-  _releaseLocal() {
-    if (this.localStream && this.network && this.network.unpublishVoiceStream) {
-      this.network.unpublishVoiceStream(this.localStream);
+  /** Собирает исходящий поток с управляемым гейтом (PTT / выключенный голос). */
+  _buildOutgoing() {
+    if (!this.localStream || this.outgoingStream) return this.outgoingStream;
+    const ctx = this.listener ? this.listener.context : this.audio.ctx;
+    if (!ctx) return null;
+    try {
+      const source = ctx.createMediaStreamSource(this.localStream);
+      const gate = ctx.createGain();
+      gate.gain.value = 0;
+      const dest = ctx.createMediaStreamDestination();
+      source.connect(gate);
+      gate.connect(dest);
+      this.outgoingStream = dest.stream;
+      this._outgoing = { source, gate, dest };
+    } catch (error) {
+      console.warn('[Voice] Не удалось собрать исходящий поток', error);
+      this.outgoingStream = null;
+      this._outgoing = null;
     }
+    return this.outgoingStream;
+  }
+
+  _teardownOutgoing() {
+    if (this.network && this.network.unpublishVoiceStream) {
+      if (this.outgoingStream) this.network.unpublishVoiceStream(this.outgoingStream);
+      if (this.localStream) this.network.unpublishVoiceStream(this.localStream);
+    }
+    if (this._outgoing) {
+      try {
+        this._outgoing.source.disconnect();
+        this._outgoing.gate.disconnect();
+      } catch (error) {
+        /* ignore */
+      }
+      if (this._outgoing.dest) {
+        this._outgoing.dest.stream.getTracks().forEach((track) => {
+          try {
+            track.stop();
+          } catch (error) {
+            /* ignore */
+          }
+        });
+      }
+    }
+    this._outgoing = null;
+    this.outgoingStream = null;
+  }
+
+  _releaseLocal() {
+    this._teardownOutgoing();
     this.localStream = null;
     if (this.localAnalyser) {
       try {
@@ -5927,13 +6175,24 @@ class VoiceChat {
   _applyTrackState() {
     if (!this.localStream) return;
     const audible = this.enabled && (this.mode === 'open' || this.pttHeld);
+    // Сырые дорожки не выключаем: анализатор должен слышать крик всегда,
+    // а тишину в эфире обеспечивает гейт исходящего потока.
     this.localStream.getAudioTracks().forEach((track) => {
-      track.enabled = audible;
+      track.enabled = true;
     });
+    if (this._outgoing) {
+      const ctx = this.listener ? this.listener.context : this.audio.ctx;
+      const now = ctx ? ctx.currentTime : 0;
+      try {
+        this._outgoing.gate.gain.setTargetAtTime(audible ? 1 : 0, now, 0.012);
+      } catch (error) {
+        this._outgoing.gate.gain.value = audible ? 1 : 0;
+      }
+    }
   }
 
   _getOutgoingStream() {
-    if (this.localStream) return this.localStream;
+    if (this.localStream) return this.outgoingStream || this.localStream;
     if (!this.silentStream) {
       const ctx = this.listener ? this.listener.context : this.audio.ctx;
       if (!ctx) return null;
@@ -6530,6 +6789,7 @@ class VoiceChat {
     if (!this.enabled || !this.network || !this.network.isActive) return;
     this.bus.emit('voice:lost', {});
     for (const id of Array.from(this.peers.keys())) this._closePeer(id);
+    this._teardownOutgoing();
     this.localStream = null;
     this._micRetryTimer = window.setTimeout(async () => {
       await this._ensureLocal();
@@ -6548,6 +6808,1344 @@ class VoiceChat {
     this._emitStatus(true);
   }
 }
+
+// =============================================================================
+// ЧАСТЬ III — ПАССАЖИР, КОТОРЫЙ НЕ ПАССАЖИР
+// -----------------------------------------------------------------------------
+// Всё собрано из примитивов и процедурных материалов: ни одной внешней модели,
+// ни одного сэмпла. Работает офлайн, в статике, без серверной части.
+// =============================================================================
+
+const DEMON_PHASE = Object.freeze({
+  IDLE: 'idle',
+  INCOGNITO: 'incognito',
+  WAKING: 'waking',
+  STUNNED: 'stunned',
+  HUNTING: 'hunting',
+  DEAD: 'dead',
+});
+
+const DEMON_BLOOD_COLOR = new THREE.Color(0x7c0a06);
+const DEMON_BLOOD_EMISSIVE = new THREE.Color(0x520602);
+
+/**
+ * Сидящий пассажир: серое пальто, фарфоровое лицо, сгорбленная поза.
+ * Умеет сидеть, обмякнуть в мешок с костями (ragdoll) и встать на охоту.
+ */
+class PassengerNPC {
+  static POSES = {
+    seated: {
+      hipY: 0.53, bodyX: 0.16, bodyZ: 0.02, headX: 0.52, headY: 0,
+      armX: -0.3, armZ: 0.06, elbowX: -1.2,
+      thighX: -1.5, kneeX: 1.5, footX: 0.12,
+    },
+    waking: {
+      hipY: 0.53, bodyX: 0.02, bodyZ: 0.05, headX: 0.06, headY: 0,
+      armX: -0.52, armZ: 0.08, elbowX: -1.32,
+      thighX: -1.5, kneeX: 1.5, footX: 0.12,
+    },
+    ragdoll: {
+      hipY: 0.17, bodyX: 1.34, bodyZ: 0.24, headX: -0.22, headY: 0.4,
+      armX: 0.16, armZ: 1.05, elbowX: -0.35,
+      thighX: 1.45, kneeX: 0.12, footX: -0.2,
+    },
+    hunt: {
+      hipY: 0.93, bodyX: -0.08, bodyZ: 0, headX: -0.14, headY: 0,
+      armX: -1.5, armZ: 0.1, elbowX: -0.24,
+      thighX: 0.02, kneeX: 0.04, footX: -0.04,
+    },
+  };
+
+  constructor({ scene }) {
+    this.scene = scene;
+    this.root = new THREE.Group();
+    this.root.name = 'Пассажир без лица';
+    scene.add(this.root);
+
+    this.seat = { ...CONFIG.npc.seat };
+    this.hitMeshes = [];
+    this._bloodMats = [];
+    this._joint = { ...PassengerNPC.POSES.seated };
+    this._targetYaw = Math.PI / 2;
+    this._time = 0;
+    this._pulse = 0;
+    this.pose = 'seated';
+    this.blood = 0;
+
+    this._build();
+    this.reset();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Сборка
+  // ---------------------------------------------------------------------------
+
+  _material(color, { roughness = 0.92, metalness = 0.04, emissive = 0x000000, emissiveIntensity = 0, weight = 1, glow = 0.4 } = {}) {
+    const material = new THREE.MeshStandardMaterial({
+      color,
+      roughness,
+      metalness,
+      emissive,
+      emissiveIntensity,
+    });
+    this._bloodMats.push({
+      material,
+      baseColor: new THREE.Color(color),
+      baseEmissive: new THREE.Color(emissive),
+      baseEmissiveIntensity: emissiveIntensity,
+      weight,
+      glow,
+    });
+    return material;
+  }
+
+  _add(geometry, material, parent, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0) {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(x, y, z);
+    mesh.rotation.set(rx, ry, rz);
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    parent.add(mesh);
+    this.hitMeshes.push(mesh);
+    return mesh;
+  }
+
+  _build() {
+    const coat = this._material(0x5a5c57, { roughness: 0.96, weight: 1, glow: 0.5 });
+    const coatDark = this._material(0x3b3e3a, { roughness: 0.94, weight: 1, glow: 0.36 });
+    const trousers = this._material(0x33352f, { roughness: 0.97, weight: 1, glow: 0.3 });
+    const porcelain = this._material(0xd7d0bd, { roughness: 0.46, metalness: 0.02, weight: 1, glow: 0.8 });
+    const hair = this._material(0x242723, { roughness: 0.9, weight: 1, glow: 0.2 });
+    const leather = this._material(0x26221e, { roughness: 0.62, metalness: 0.12, weight: 1, glow: 0.24 });
+
+    this.hips = new THREE.Group();
+    this.hips.position.y = this.seat.y + 0.06;
+    this.root.add(this.hips);
+
+    this.body = new THREE.Group();
+    this.hips.add(this.body);
+
+    // Пальто / торс.
+    this._add(new THREE.BoxGeometry(0.43, 0.63, 0.3), coat, this.body, 0, 0.33, 0);
+    // Борт пальто и воротник.
+    this._add(new THREE.BoxGeometry(0.08, 0.5, 0.02), coatDark, this.body, 0, 0.31, 0.155);
+    this._add(new THREE.BoxGeometry(0.3, 0.08, 0.26), coatDark, this.body, 0, 0.625, 0);
+    // Шарф.
+    this._add(new THREE.BoxGeometry(0.24, 0.09, 0.22), leather, this.body, 0, 0.585, 0.02);
+    // Плечи.
+    this._add(new THREE.BoxGeometry(0.5, 0.1, 0.27), coat, this.body, 0, 0.55, 0);
+
+    // Голова.
+    this.head = new THREE.Group();
+    this.head.position.set(0, 0.66, 0);
+    this.body.add(this.head);
+    this._add(new THREE.CylinderGeometry(0.055, 0.06, 0.1, 8), porcelain, this.head, 0, 0.02, 0);
+    this._add(new THREE.SphereGeometry(0.132, 16, 12), porcelain, this.head, 0, 0.205, 0);
+    // Фарфоровая маска: гладкая лицевая пластина без рта.
+    this._add(new THREE.CylinderGeometry(0.118, 0.105, 0.1, 14, 1, false, 0, Math.PI * 2), porcelain, this.head, 0, 0.205, 0.055, Math.PI / 2, 0, 0);
+    // Глазные впадины — две чёрные щели.
+    this._add(new THREE.BoxGeometry(0.052, 0.018, 0.02), leather, this.head, -0.048, 0.225, 0.112);
+    this._add(new THREE.BoxGeometry(0.052, 0.018, 0.02), leather, this.head, 0.048, 0.225, 0.112);
+    // Волосы/кепка.
+    this._add(new THREE.SphereGeometry(0.14, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2), hair, this.head, 0, 0.235, -0.01);
+    this._add(new THREE.CylinderGeometry(0.155, 0.155, 0.022, 16), hair, this.head, 0, 0.3, 0.01);
+
+    // Глаза: в обычной личине погашены, после пробуждения — красные.
+    this.eyeMaterial = new THREE.MeshStandardMaterial({
+      color: 0x120504,
+      emissive: 0xff2408,
+      emissiveIntensity: 0,
+      roughness: 0.3,
+    });
+    this._add(new THREE.SphereGeometry(0.017, 8, 6), this.eyeMaterial, this.head, -0.048, 0.226, 0.118);
+    this._add(new THREE.SphereGeometry(0.017, 8, 6), this.eyeMaterial, this.head, 0.048, 0.226, 0.118);
+
+    // Руки.
+    const buildArm = (side) => {
+      const shoulder = new THREE.Group();
+      shoulder.position.set(side * 0.255, 0.53, 0);
+      this.body.add(shoulder);
+      this._add(new THREE.CapsuleGeometry(0.056, 0.24, 3, 8), coat, shoulder, 0, -0.15, 0);
+      const elbow = new THREE.Group();
+      elbow.position.set(0, -0.3, 0);
+      shoulder.add(elbow);
+      this._add(new THREE.CapsuleGeometry(0.048, 0.2, 3, 8), coatDark, elbow, 0, -0.14, 0);
+      this._add(new THREE.SphereGeometry(0.055, 10, 8), porcelain, elbow, 0, -0.29, 0.01);
+      return { shoulder, elbow };
+    };
+    const left = buildArm(-1);
+    const right = buildArm(1);
+    this.armL = left.shoulder;
+    this.elbowL = left.elbow;
+    this.armR = right.shoulder;
+    this.elbowR = right.elbow;
+
+    // Ноги.
+    const buildLeg = (side) => {
+      const hip = new THREE.Group();
+      hip.position.set(side * 0.105, 0, 0);
+      this.hips.add(hip);
+      this._add(new THREE.CapsuleGeometry(0.075, 0.26, 3, 8), trousers, hip, 0, -0.2, 0);
+      const knee = new THREE.Group();
+      knee.position.set(0, -0.4, 0);
+      hip.add(knee);
+      this._add(new THREE.CapsuleGeometry(0.062, 0.3, 3, 8), trousers, knee, 0, -0.23, 0);
+      const foot = this._add(new THREE.BoxGeometry(0.13, 0.075, 0.25), leather, knee, 0, -0.455, 0.06);
+      return { hip, knee, foot };
+    };
+    const legLeft = buildLeg(-1);
+    const legRight = buildLeg(1);
+    this.legL = legLeft.hip;
+    this.kneeL = legLeft.knee;
+    this.footL = legLeft.foot;
+    this.legR = legRight.hip;
+    this.kneeR = legRight.knee;
+    this.footR = legRight.foot;
+
+    // Тень-пятно под телом: без неё в темноте фигура «висит».
+    const shadowMaterial = new THREE.MeshBasicMaterial({
+      color: 0x000000,
+      transparent: true,
+      opacity: 0.5,
+      depthWrite: false,
+    });
+    this.shadow = new THREE.Mesh(new THREE.CircleGeometry(0.38, 20), shadowMaterial);
+    this.shadow.rotation.x = -Math.PI / 2;
+    this.shadow.position.y = 0.012;
+    this.root.add(this.shadow);
+
+    // Метка захвата.
+    this.marker = new THREE.Mesh(
+      new THREE.RingGeometry(0.3, 0.36, 26),
+      new THREE.MeshBasicMaterial({
+        color: 0xb9f7a4,
+        transparent: true,
+        opacity: 0.55,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    this.marker.rotation.x = -Math.PI / 2;
+    this.marker.position.y = 0.02;
+    this.marker.visible = false;
+    this.root.add(this.marker);
+
+    // Красное свечение вокруг тела после пробуждения.
+    this.aura = new THREE.PointLight(0xff2a12, 0, 4.6, 2);
+    this.aura.position.set(0, 1.15, 0);
+    this.root.add(this.aura);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Состояние
+  // ---------------------------------------------------------------------------
+
+  reset() {
+    this.blood = 0;
+    this.pose = 'seated';
+    this.root.visible = true;
+    this.root.position.set(this.seat.x, 0, this.seat.z);
+    this.root.rotation.y = Math.PI / 2;
+    this._targetYaw = Math.PI / 2;
+    this._time = 0;
+    this._joint = { ...PassengerNPC.POSES.seated };
+    this.hips.position.y = this._joint.hipY;
+    this.setBlood(0, true);
+    this.setHighlight(false);
+    this._applyJoints();
+  }
+
+  setPose(name) {
+    if (!PassengerNPC.POSES[name]) return;
+    this.pose = name;
+  }
+
+  setYaw(yaw, snap = false) {
+    this._targetYaw = yaw;
+    if (snap) this.root.rotation.y = yaw;
+  }
+
+  get yaw() {
+    return this.root.rotation.y;
+  }
+
+  /** Мгновенно «наливает» материалы кровью. amount=1 — полное преображение. */
+  setBlood(amount, instant = false) {
+    this.blood = clamp(Number(amount) || 0, 0, 1);
+    for (const entry of this._bloodMats) {
+      entry.material.color.copy(entry.baseColor)
+        .lerp(DEMON_BLOOD_COLOR, this.blood * entry.weight);
+      entry.material.emissive.copy(entry.baseEmissive)
+        .lerp(DEMON_BLOOD_EMISSIVE, this.blood * entry.weight);
+      entry.material.emissiveIntensity = entry.baseEmissiveIntensity + this.blood * entry.glow;
+    }
+    if (this.eyeMaterial) this.eyeMaterial.emissiveIntensity = this.blood * 7.5;
+    if (this.aura) this.aura.intensity = this.blood * 2.6;
+    if (this.shadow) this.shadow.material.opacity = 0.5 - this.blood * 0.18;
+    if (instant) this._applyJoints();
+  }
+
+  setHighlight(on) {
+    if (this.marker) this.marker.visible = Boolean(on);
+  }
+
+  _applyJoints() {
+    const j = this._joint;
+    this.hips.position.y = j.hipY;
+    this.body.rotation.set(j.bodyX, 0, j.bodyZ, 'XYZ');
+    this.head.rotation.set(j.headX, j.headY, 0, 'XYZ');
+    this.armL.rotation.set(j.armX, 0, j.armZ, 'XYZ');
+    this.armR.rotation.set(j.armX, 0, -j.armZ, 'XYZ');
+    this.elbowL.rotation.x = j.elbowX;
+    this.elbowR.rotation.x = j.elbowX;
+    this.legL.rotation.x = j.thighX;
+    this.legR.rotation.x = j.thighX;
+    this.kneeL.rotation.x = j.kneeX;
+    this.kneeR.rotation.x = j.kneeX;
+    this.footL.rotation.x = j.footX;
+    this.footR.rotation.x = j.footX;
+  }
+
+  update(dt, elapsed) {
+    if (!this.root.visible) return;
+    this._time += dt;
+
+    const target = PassengerNPC.POSES[this.pose] || PassengerNPC.POSES.seated;
+    const lambda = this.pose === 'ragdoll' ? 7 : 9;
+    for (const key of Object.keys(target)) {
+      this._joint[key] = damp(this._joint[key], target[key], lambda, dt);
+    }
+
+    const shiver = this.pose === 'waking' ? Math.sin(this._time * 37) * 0.012 : 0;
+    const breathe = this.pose === 'seated' ? Math.sin(elapsed * 1.6) * 0.008 : 0;
+
+    this.hips.position.y = this._joint.hipY + breathe;
+    this.body.rotation.set(this._joint.bodyX + shiver, 0, this._joint.bodyZ + shiver * 0.6, 'XYZ');
+    this.head.rotation.set(
+      this._joint.headX + breathe * 1.5,
+      this._joint.headY + (this.pose === 'seated' ? Math.sin(elapsed * 0.23) * 0.05 : Math.sin(elapsed * 5.2) * 0.04),
+      0,
+      'XYZ',
+    );
+    this.armL.rotation.set(this._joint.armX, 0, this._joint.armZ, 'XYZ');
+    this.armR.rotation.set(this._joint.armX, 0, -this._joint.armZ, 'XYZ');
+    this.elbowL.rotation.x = this._joint.elbowX;
+    this.elbowR.rotation.x = this._joint.elbowX;
+    this.legL.rotation.x = this._joint.thighX;
+    this.legR.rotation.x = this._joint.thighX;
+    this.kneeL.rotation.x = this._joint.kneeX;
+    this.kneeR.rotation.x = this._joint.kneeX;
+    this.footL.rotation.x = this._joint.footX;
+    this.footR.rotation.x = this._joint.footX;
+
+    // Плавный поворот корпуса к цели (короткая дуга).
+    const delta = Math.atan2(
+      Math.sin(this._targetYaw - this.root.rotation.y),
+      Math.cos(this._targetYaw - this.root.rotation.y),
+    );
+    this.root.rotation.y += delta * Math.min(1, dt * 10);
+
+    if (this.marker && this.marker.visible) {
+      this._pulse += dt;
+      this.marker.material.opacity = 0.34 + Math.sin(this._pulse * 4.2) * 0.18;
+    }
+
+    if (this.aura && this.blood > 0) {
+      this.aura.intensity = this.blood * (2.35 + Math.sin(elapsed * 6.4) * 0.28);
+    }
+    if (this.eyeMaterial && this.blood > 0) {
+      this.eyeMaterial.emissiveIntensity = this.blood * (6.4 + Math.sin(elapsed * 9.1) * 1.1);
+    }
+  }
+}
+
+/**
+ * «Уши» вагона: непрерывное распознавание русской речи + детектор крика
+ * по сырому уровню микрофона. Микрофон берётся по ссылке у AudioManager,
+ * поэтому не конфликтует с голосовым чатом.
+ */
+class VoiceWatcher {
+  static PATTERNS = {
+    'демон': /(?:^|\s)демон(?:а|у|ом|е|ы|ов)?(?=\s|$)/,
+    'бежим': /(?:^|\s)(?:бежим|беги|бегом|бегите)(?=\s|$)/,
+    'шокер': /(?:^|\s)шокер(?:а|у|ом|е|ы|ов)?(?=\s|$)/,
+    'шесть пальцев': /шесть\s*пальц(?:ев|а|ы)?/,
+  };
+
+  constructor({ audio, bus, config }) {
+    this.audio = audio;
+    this.bus = bus;
+    this.config = config;
+    this.active = false;
+    this.paused = false;
+    this.micState = 'off';
+    this.speechState = 'off';
+    this.lastTranscript = '';
+    this._micOk = false;
+    this._fired = false;
+    this._recognition = null;
+    this._restartTimer = 0;
+    this._screamAccum = 0;
+    this._lastScreamAt = -Infinity;
+    this._networkErrors = 0;
+    this._lastStatus = '';
+    this._supported = Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+    this._onEnd = () => this._handleEnd();
+  }
+
+  get status() {
+    return { mic: this.micState, speech: this.speechState };
+  }
+
+  _emit() {
+    const key = `${this.micState}|${this.speechState}`;
+    if (key === this._lastStatus) return;
+    this._lastStatus = key;
+    this.bus.emit('speech:status', { mic: this.micState, speech: this.speechState });
+  }
+
+  async start() {
+    if (this.active) {
+      this.resume();
+      return;
+    }
+    this.active = true;
+    this.paused = false;
+    this._fired = false;
+    this.lastTranscript = '';
+    this._screamAccum = 0;
+    this._networkErrors = 0;
+    this.micState = 'requesting';
+    this.speechState = 'off';
+    this._emit();
+
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      this._micOk = false;
+      this.micState = 'unsupported';
+      this.speechState = 'unsupported';
+      this._emit();
+      return;
+    }
+
+    try {
+      await this.audio.acquireMic('voiceai');
+      if (!this.active) {
+        this.audio.releaseMic('voiceai');
+        return;
+      }
+      this._micOk = true;
+      this.micState = 'on';
+    } catch (error) {
+      this._micOk = false;
+      this.micState = error && error.code === 'MEDIA_UNSUPPORTED' ? 'unsupported' : 'denied';
+      this.speechState = this._supported ? 'mic-denied' : 'unsupported';
+      this._emit();
+      return;
+    }
+
+    if (!this._supported) {
+      this.speechState = 'unsupported';
+      this._emit();
+      return;
+    }
+
+    this._buildRecognition();
+    this._startRecognition();
+    this._emit();
+  }
+
+  stop() {
+    this.active = false;
+    this.paused = false;
+    window.clearTimeout(this._restartTimer);
+    this._restartTimer = 0;
+    this._teardownRecognition();
+    if (this._micOk) this.audio.releaseMic('voiceai');
+    this._micOk = false;
+    this._screamAccum = 0;
+    this.micState = 'off';
+    this.speechState = 'off';
+    this._emit();
+  }
+
+  pause() {
+    if (!this.active || this.paused) return;
+    this.paused = true;
+    this._screamAccum = 0;
+    window.clearTimeout(this._restartTimer);
+    this._restartTimer = 0;
+    if (this._recognition) {
+      try {
+        this._recognition.abort();
+      } catch (error) {
+        /* ignore */
+      }
+    }
+    if (this._micOk) this.speechState = 'paused';
+    this._emit();
+  }
+
+  resume() {
+    if (!this.active || !this.paused) return;
+    this.paused = false;
+    if (this._micOk && this._supported && this.speechState !== 'denied' && this.speechState !== 'error') {
+      this._startRecognition();
+    }
+    this._emit();
+  }
+
+  _buildRecognition() {
+    if (this._recognition) return;
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) return;
+    let recognition;
+    try {
+      recognition = new Recognition();
+    } catch (error) {
+      this.speechState = 'unsupported';
+      return;
+    }
+    recognition.lang = this.config.lang;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 3;
+    recognition.onstart = () => {
+      this._networkErrors = 0;
+      this.speechState = 'listening';
+      this._emit();
+    };
+    recognition.onresult = (event) => {
+      this._networkErrors = 0;
+      if (!event.results) return;
+      let text = '';
+      for (let index = event.resultIndex || 0; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        if (!result) continue;
+        const alternative = result[0];
+        if (alternative && alternative.transcript) text += ` ${alternative.transcript}`;
+      }
+      if (text.trim()) this.onTranscript(text);
+    };
+    recognition.onerror = (event) => {
+      const error = event && event.error;
+      if (error === 'not-allowed' || error === 'service-not-allowed') {
+        this.speechState = 'denied';
+        this._emit();
+        return;
+      }
+      if (error === 'language-not-supported') {
+        // В сборке без ru-RU распознавание бессмысленно: остаётся детектор крика.
+        this.speechState = 'unsupported';
+        this._emit();
+        return;
+      }
+      if (error === 'audio-capture') {
+        this._micOk = false;
+        this.micState = 'denied';
+        this.speechState = 'off';
+        this._emit();
+        return;
+      }
+      if (error === 'network') {
+        this._networkErrors += 1;
+        if (this._networkErrors >= 3) {
+          this.speechState = 'error';
+          this._emit();
+          window.clearTimeout(this._restartTimer);
+          this._restartTimer = 0;
+        }
+        return;
+      }
+      // no-speech, aborted, audio-capture — перезапуск сделает onend.
+    };
+    recognition.onend = this._onEnd;
+    this._recognition = recognition;
+  }
+
+  _teardownRecognition() {
+    if (!this._recognition) return;
+    const recognition = this._recognition;
+    this._recognition = null;
+    recognition.onstart = null;
+    recognition.onresult = null;
+    recognition.onerror = null;
+    recognition.onend = null;
+    try {
+      recognition.abort();
+    } catch (error) {
+      /* ignore */
+    }
+  }
+
+  _startRecognition() {
+    if (!this.active || this.paused || !this._recognition) return;
+    if (this.speechState === 'denied' || this.speechState === 'error'
+      || this.speechState === 'unsupported') return;
+    window.clearTimeout(this._restartTimer);
+    this._restartTimer = 0;
+    this.speechState = 'restarting';
+    this._emit();
+    try {
+      this._recognition.start();
+    } catch (error) {
+      // InvalidStateError: распознавание уже идёт.
+      if (!error || error.name !== 'InvalidStateError') {
+        this._restartTimer = window.setTimeout(() => this._startRecognition(), this.config.restartDelay);
+      }
+    }
+  }
+
+  _handleEnd() {
+    if (!this.active || this.paused) {
+      this.speechState = this.active ? 'paused' : 'off';
+      this._emit();
+      return;
+    }
+    if (this.speechState === 'denied' || this.speechState === 'error'
+      || this.speechState === 'unsupported' || !this._micOk) {
+      this._emit();
+      return;
+    }
+    this.speechState = 'restarting';
+    this._emit();
+    window.clearTimeout(this._restartTimer);
+    this._restartTimer = window.setTimeout(
+      () => this._startRecognition(),
+      this.config.restartDelay,
+    );
+  }
+
+  normalize(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/ё/g, 'е')
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      // «6 пальцев» после чистки знаков становится «шесть пальцев».
+      .replace(/(^|\s)6(?=\s|$)/g, '$1шесть');
+  }
+
+  onTranscript(text) {
+    if (!this.active || this.paused) return;
+    const normalized = this.normalize(text);
+    if (!normalized) return;
+    this.lastTranscript = normalized;
+    this.bus.emit('speech:heard', { text: normalized });
+
+    for (const keyword of this.config.keywords) {
+      const normalizedKeyword = String(keyword).toLowerCase().replace(/ё/g, 'е');
+      const pattern = VoiceWatcher.PATTERNS[normalizedKeyword]
+        || new RegExp(`(?:^|\\s)${normalizedKeyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`);
+      if (pattern.test(normalized)) {
+        this._fire('voice', normalizedKeyword);
+        return;
+      }
+    }
+  }
+
+  update(dt) {
+    if (!this.active || this.paused) return;
+    if (!this._micOk) {
+      // Микрофон могли отобрать в системе и вернуть через голосовой чат.
+      if (this.audio.mic.active) {
+        this._micOk = true;
+        this.micState = 'on';
+        if (!this._recognition && this._supported) {
+          this._buildRecognition();
+          this._startRecognition();
+        }
+        this._emit();
+      }
+      return;
+    }
+    if (this._fired) return;
+    if (this.audio.mic.active === false) {
+      this._micOk = false;
+      this.micState = 'denied';
+      this.speechState = 'off';
+      this._emit();
+      return;
+    }
+    const { level } = this.audio.getMicLevel();
+    if (!Number.isFinite(level)) return;
+    if (level >= this.config.screamLevel) {
+      this._screamAccum += dt;
+      if (this._screamAccum >= this.config.screamHold) {
+        const now = performance.now();
+        if (now - this._lastScreamAt > this.config.screamCooldown) {
+          this._lastScreamAt = now;
+          this._fire('scream', null);
+        }
+      }
+    } else {
+      this._screamAccum = Math.max(0, this._screamAccum - dt * 2.4);
+    }
+  }
+
+  _fire(source, keyword) {
+    if (this._fired) return;
+    this._fired = true;
+    this._screamAccum = 0;
+    this.bus.emit('demon:heard', { source, keyword });
+  }
+}
+
+/**
+ * Режиссёр Части III. Хост владеет пассажиром и рассылает его состояние,
+ * гости присылают только «схватить» и «тащу». В соло роль хоста играет
+ * локальный NetworkManager без соединений — код тот же самый.
+ */
+class DemonDirector {
+  constructor({
+    scene, camera, world, player, audio, bus, network, ui, watcher,
+    getPlayerName, onGameOver,
+  }) {
+    this.scene = scene;
+    this.camera = camera;
+    this.world = world;
+    this.player = player;
+    this.audio = audio;
+    this.bus = bus;
+    this.network = network;
+    this.ui = ui;
+    this.watcher = watcher;
+    this.getPlayerName = getPlayerName;
+    this.onGameOver = onGameOver;
+
+    this.npc = new PassengerNPC({ scene });
+    this.active = false;
+    this.phase = DEMON_PHASE.IDLE;
+    this._ray = new THREE.Raycaster();
+    this._center = new THREE.Vector2(0, 0);
+    this._rayTarget = null;
+    this._npcDistance = Infinity;
+    this._wakeTimer = 0;
+    this._stunTimer = 0;
+    this._huntTime = 0;
+    this._stateClock = 0;
+    this._draggingId = null;
+    this._dragStartedAt = 0;
+    this._deadIds = new Set();
+    this._killed = false;
+    this._guestHuntAnnounced = false;
+    this._selfPos = new THREE.Vector3();
+    this._euler = new THREE.Euler();
+
+    this.bus.on('player:interact', (payload) => this._onInteract(payload));
+    this.bus.on('demon:heard', (payload) => this._onHeard(payload));
+    this.bus.on('network:demon', (payload) => this._onNetworkDemon(payload));
+    this.bus.on('network:peerJoined', (player) => this._onPeerJoined(player));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Жизненный цикл
+  // ---------------------------------------------------------------------------
+
+  activate() {
+    this.npc.reset();
+    this.active = true;
+    this.phase = DEMON_PHASE.INCOGNITO;
+    this._wakeTimer = 0;
+    this._stunTimer = 0;
+    this._huntTime = 0;
+    this._stateClock = 0;
+    this._draggingId = null;
+    this._deadIds.clear();
+    this._killed = false;
+    this._guestHuntAnnounced = false;
+    this._rayTarget = null;
+    this._npcDistance = Infinity;
+    this.player.setSpeedScale(1);
+    this.world.setBlackout(false);
+    this.ui.setScare(false);
+    this.ui.hidePrompt();
+  }
+
+  reset() {
+    this.active = false;
+    this.phase = DEMON_PHASE.IDLE;
+    this._draggingId = null;
+    this._deadIds.clear();
+    this._killed = false;
+    this._rayTarget = null;
+    this._npcDistance = Infinity;
+    this._wakeTimer = 0;
+    this._stunTimer = 0;
+    this.player.setSpeedScale(1);
+    this.world.setBlackout(false);
+    this.ui.setScare(false);
+    this.ui.hidePrompt();
+    this.npc.reset();
+  }
+
+  /** Пауза: отпускаем тело, чтобы замедление не «залипло» после возврата. */
+  pause() {
+    this._endDrag({ silent: true });
+    this._rayTarget = null;
+    this.npc.setHighlight(false);
+    this.ui.hidePrompt();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Триггеры
+  // ---------------------------------------------------------------------------
+
+  _onHeard({ source } = {}) {
+    if (!this.active || this.phase !== DEMON_PHASE.INCOGNITO) return;
+    if (this._isHost()) {
+      this._beginReveal(source || 'voice', false);
+      return;
+    }
+    this.network.sendDemon({ kind: 'wake', source: source || 'voice', stun: false });
+    // До ответа хоста локально показываем, что сигнал ушёл.
+    this.ui.showToast('СИГНАЛ УШЁЛ В ВАГОН…', 'warning', 1200);
+  }
+
+  _beginReveal(source, stun) {
+    if (this.phase !== DEMON_PHASE.INCOGNITO) return false;
+    this.network.sendDemon({ kind: 'wake', source, stun: Boolean(stun) });
+    this._applyReveal(source, stun);
+    return true;
+  }
+
+  _applyReveal(source, stun) {
+    if (this.phase !== DEMON_PHASE.INCOGNITO) return;
+    this.phase = stun ? DEMON_PHASE.STUNNED : DEMON_PHASE.WAKING;
+    this._stunTimer = stun ? CONFIG.npc.stunTime : 0;
+    this._wakeTimer = stun ? 0 : CONFIG.demon.wakeDelay;
+    this._killed = false;
+    this._guestHuntAnnounced = false;
+
+    // Маска слетает мгновенно: кровь, глаза, свечение.
+    this.npc.setBlood(1);
+    this.npc.setPose(stun ? 'ragdoll' : 'waking');
+    this.npc.setHighlight(false);
+    this.ui.hidePrompt();
+    this.ui.setScare(true);
+    this.world.setBlackout(true);
+    this.audio.screech();
+
+    const target = this._closestPlayer();
+    if (target) {
+      const dx = target.x - this.npc.root.position.x;
+      const dz = target.z - this.npc.root.position.z;
+      this.npc.setYaw(Math.atan2(dx, dz), true);
+    }
+
+    const message = source === 'scream'
+      ? 'КРИК РАЗБУДИЛ ЕГО // СВЕТ ПОГАС'
+      : source === 'grab'
+        ? 'ВЫ ПРИКОСНУЛИСЬ К НЕМУ // СВЕТ ПОГАС'
+        : 'ОН УСЛЫШАЛ ВАС // СВЕТ ПОГАС';
+    this.ui.showToast(message, 'error', 6200);
+    this.bus.emit('demon:awakened', { source });
+  }
+
+  _startHunt() {
+    if (this.phase === DEMON_PHASE.HUNTING || this.phase === DEMON_PHASE.DEAD) return;
+    this.phase = DEMON_PHASE.HUNTING;
+    this._huntTime = 0;
+    this._wakeTimer = 0;
+    this._stunTimer = 0;
+    this._endDrag({ silent: true });
+    this.npc.setPose('hunt');
+    this.ui.hidePrompt();
+    if (!this._guestHuntAnnounced) {
+      this._guestHuntAnnounced = true;
+      this.ui.showToast('ОН ВСТАЛ // БЕГИТЕ', 'error', 3600);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Кадр
+  // ---------------------------------------------------------------------------
+
+  update(dt, elapsed) {
+    if (!this.active) return;
+    this.npc.update(dt, elapsed);
+
+    if (this.phase === DEMON_PHASE.WAKING) {
+      this._wakeTimer -= dt;
+      if (this._wakeTimer <= 0) this._startHunt();
+    } else if (this.phase === DEMON_PHASE.STUNNED) {
+      this._stunTimer -= dt;
+      if (this._stunTimer <= 0) this._startHunt();
+    }
+
+    if (this.phase === DEMON_PHASE.INCOGNITO || this.phase === DEMON_PHASE.STUNNED) {
+      this._updateFocus();
+      this._updatePrompt();
+    } else {
+      if (this._rayTarget) {
+        this._rayTarget = null;
+        this.npc.setHighlight(false);
+      }
+      this.ui.hidePrompt();
+    }
+
+    if (this.phase === DEMON_PHASE.STUNNED) this._updateDragging(dt);
+    if (this.phase === DEMON_PHASE.HUNTING && this._isHost()) this._updateHunt(dt);
+    if (this._isHost()) this._broadcastState(dt);
+  }
+
+  _updateFocus() {
+    // Матрица камеры могла ещё не обновиться в этом кадре — иначе луч
+    // уходит в старую точку и подсказка «мигает».
+    this.camera.updateMatrixWorld(true);
+    this.npc.root.updateMatrixWorld(true);
+    const npc = this.npc.root.position;
+    const distance = Math.hypot(this.player.position.x - npc.x, this.player.position.z - npc.z);
+    this._npcDistance = distance;
+
+    let hit = null;
+    if (distance <= CONFIG.npc.lookDistance) {
+      this._ray.setFromCamera(this._center, this.camera);
+      const hits = this._ray.intersectObjects(this.npc.hitMeshes, false);
+      if (hits.length > 0 && hits[0].distance <= CONFIG.npc.lookDistance + 1.4) hit = hits[0];
+    }
+    this._rayTarget = hit;
+    this.npc.setHighlight(Boolean(hit));
+  }
+
+  _updatePrompt() {
+    if (this.phase === DEMON_PHASE.STUNNED) {
+      // Тело уже на полу: смотреть точно в него не нужно, достаточно близости.
+      if (this._draggingId && this._draggingId === this._selfId()) {
+        this.ui.showPrompt('ОТПУСТИТЕ E — БРОСИТЬ ТЕЛО', 'E', 'danger');
+      } else if (this._npcDistance <= CONFIG.npc.grabDistance + 0.5) {
+        this.ui.showPrompt('УДЕРЖИВАЙТЕ E — ТАЩИТЬ ТЕЛО', 'E', 'danger');
+      } else {
+        this.ui.hidePrompt();
+      }
+      return;
+    }
+    if (!this._rayTarget) {
+      this.ui.hidePrompt();
+      return;
+    }
+    if (this.phase === DEMON_PHASE.INCOGNITO) {
+      if (this._npcDistance <= CONFIG.npc.grabDistance) {
+        this.ui.showPrompt('СХВАТИТЬ ПАССАЖИРА ЗА ПЛЕЧО', 'E', 'normal');
+      } else {
+        this.ui.showPrompt('ПОДОЙДИТЕ БЛИЖЕ', '', 'normal');
+      }
+      return;
+    }
+    this.ui.hidePrompt();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Взаимодействие
+  // ---------------------------------------------------------------------------
+
+  _onInteract({ held } = {}) {
+    if (!this.active) return;
+    if (this.phase !== DEMON_PHASE.INCOGNITO && this.phase !== DEMON_PHASE.STUNNED) return;
+
+    if (!held) {
+      if (this._draggingId === this._selfId()) this._endDrag();
+      return;
+    }
+
+    if (this.phase === DEMON_PHASE.STUNNED) {
+      if (this._npcDistance <= CONFIG.npc.grabDistance + 0.5) this._beginDrag();
+      return;
+    }
+
+    if (!this._rayTarget) return;
+    if (this._npcDistance > CONFIG.npc.grabDistance) return;
+    if (this._isHost()) {
+      this._beginReveal('grab', true);
+    } else {
+      this.network.sendDemon({ kind: 'grab' });
+    }
+  }
+
+  _beginDrag() {
+    if (this.phase !== DEMON_PHASE.STUNNED) return;
+    const selfId = this._selfId();
+    if (this._draggingId && this._draggingId !== selfId) return;
+    this._draggingId = selfId;
+    this._dragStartedAt = performance.now();
+    this.player.setSpeedScale(CONFIG.npc.dragScale);
+    if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: true });
+    this.ui.showToast('ТЕЛО СЛУШАЕТСЯ // ВЫ ЕДВА ИДЁТЕ', 'warning', 2600);
+    this._stateClock = 0;
+    this._updatePrompt();
+  }
+
+  _endDrag({ silent = false } = {}) {
+    if (!this._draggingId) return;
+    const selfId = this._selfId();
+    const wasLocal = this._draggingId === selfId;
+    this._draggingId = null;
+    this.player.setSpeedScale(1);
+    if (!this._isHost()) this.network.sendDemon({ kind: 'drag', active: false });
+    if (wasLocal && !silent) this.ui.showToast('ТЕЛО ОСТАЛОСЬ НА ПОЛУ', 'warning', 2200);
+    if (this.active && this.phase === DEMON_PHASE.STUNNED) this._updatePrompt();
+  }
+
+  _updateDragging(dt) {
+    if (!this._draggingId) return;
+    const pose = this._playerPose(this._draggingId);
+    if (!pose) {
+      this._endDrag({ silent: true });
+      return;
+    }
+    this._placeBody(pose, dt);
+  }
+
+  _placeBody(pose, dt) {
+    const yaw = pose.yaw;
+    const forwardX = -Math.sin(yaw);
+    const forwardZ = -Math.cos(yaw);
+    const bounds = this.world.bounds;
+    const targetX = clamp(
+      pose.x + forwardX * CONFIG.npc.dragOffset,
+      bounds.minX + CONFIG.demon.bodyRadius,
+      bounds.maxX - CONFIG.demon.bodyRadius,
+    );
+    const targetZ = clamp(
+      pose.z + forwardZ * CONFIG.npc.dragOffset,
+      bounds.minZ + CONFIG.demon.bodyRadius,
+      bounds.maxZ - CONFIG.demon.bodyRadius,
+    );
+    const position = this.npc.root.position;
+    const lambda = CONFIG.npc.dragLerp;
+    position.x = damp(position.x, targetX, lambda, dt);
+    position.z = damp(position.z, targetZ, lambda, dt);
+    this.npc.setYaw(yaw + Math.PI, true);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Охота (только хост)
+  // ---------------------------------------------------------------------------
+
+  _updateHunt(dt) {
+    this._huntTime += dt;
+    const target = this._closestPlayer();
+    if (!target) return;
+
+    const npc = this.npc.root.position;
+    const dx = target.x - npc.x;
+    const dz = target.z - npc.z;
+    const distance = Math.hypot(dx, dz);
+    if (distance <= CONFIG.demon.killDistance) {
+      this._kill(target);
+      return;
+    }
+
+    this.npc.setYaw(Math.atan2(dx, dz), false);
+    const ramp = clamp(0.5 + (this._huntTime / Math.max(0.01, CONFIG.demon.standTime)) * 0.5, 0.5, 1);
+    const step = CONFIG.demon.huntSpeed * ramp * dt;
+    this._advance(target, step);
+
+    const after = Math.hypot(target.x - npc.x, target.z - npc.z);
+    if (after <= CONFIG.demon.killDistance) this._kill(target);
+  }
+
+  _advance(target, step) {
+    const npc = this.npc.root.position;
+    const dx = target.x - npc.x;
+    const dz = target.z - npc.z;
+    let moveX = 0;
+    let moveZ = 0;
+
+    if (Math.abs(npc.x) > 1.02) {
+      // Тело поднимается из-за скамьи: коллизии игнорируем, пока оно
+      // не выйдет в проход, иначе демон навсегда застревает в мебели.
+      moveX = Math.sign(CONFIG.demon.aisleX - npc.x) || 1;
+      moveZ = Math.abs(dz) > 0.8 ? Math.sign(dz) * 0.4 : 0;
+    } else if (Math.abs(dz) > 0.85) {
+      moveX = Math.sign(CONFIG.demon.aisleX - npc.x) * 0.35;
+      moveZ = Math.sign(dz);
+    } else {
+      moveX = dx;
+      moveZ = dz;
+    }
+
+    const length = Math.hypot(moveX, moveZ) || 1;
+    const stepX = (moveX / length) * step;
+    const stepZ = (moveZ / length) * step;
+
+    if (Math.abs(npc.x) > 1.02) {
+      npc.x += stepX;
+      npc.z += stepZ;
+      return;
+    }
+
+    const blocked = (x, z) => {
+      const radius = CONFIG.demon.bodyRadius;
+      const bounds = this.world.bounds;
+      if (
+        x < bounds.minX + radius || x > bounds.maxX - radius
+        || z < bounds.minZ + radius || z > bounds.maxZ - radius
+      ) {
+        return true;
+      }
+      for (const collider of this.world.colliders) {
+        const closestX = clamp(x, collider.minX, collider.maxX);
+        const closestZ = clamp(z, collider.minZ, collider.maxZ);
+        const offsetX = x - closestX;
+        const offsetZ = z - closestZ;
+        if (offsetX * offsetX + offsetZ * offsetZ < radius * radius) return true;
+      }
+      return false;
+    };
+
+    if (!blocked(npc.x + stepX, npc.z + stepZ)) {
+      npc.x += stepX;
+      npc.z += stepZ;
+      return;
+    }
+    if (!blocked(npc.x + stepX, npc.z)) {
+      npc.x += stepX;
+      return;
+    }
+    if (!blocked(npc.x, npc.z + stepZ)) {
+      npc.z += stepZ;
+      return;
+    }
+    // Обходим препятствие по кратчайшей стороне.
+    const nudge = Math.sign(CONFIG.demon.aisleX - npc.x) || 1;
+    if (!blocked(npc.x + nudge * 0.02, npc.z)) npc.x += nudge * 0.02;
+  }
+
+  _kill(target) {
+    if (this._killed || this.phase === DEMON_PHASE.DEAD) return;
+    this._killed = true;
+    const name = target.name || 'ПАССАЖИР';
+    this._deadIds.add(target.id);
+    this.network.sendDemon({ kind: 'kill', target: target.id, name });
+    this._endDrag({ silent: true });
+    this.phase = DEMON_PHASE.DEAD;
+    this.npc.setPose('hunt');
+    // Игра заканчивается для всего экипажа: это хоррор, а не аркада.
+    this.onGameOver({ target: target.id, name });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Игроки и сеть
+  // ---------------------------------------------------------------------------
+
+  _selfId() {
+    return (this.network && this.network.selfId) || 'local';
+  }
+
+  _isHost() {
+    return Boolean(this.network && this.network.isHost);
+  }
+
+  _cameraYaw() {
+    this._euler.setFromQuaternion(this.camera.quaternion, 'YXZ');
+    return this._euler.y;
+  }
+
+  _nameOf(id) {
+    if (id === this._selfId()) return this.getPlayerName ? this.getPlayerName() : 'ВЫ';
+    const entry = this.network.roster && this.network.roster.get(id);
+    return (entry && entry.name) || 'ПАССАЖИР';
+  }
+
+  _playerPose(id) {
+    if (id === this._selfId()) {
+      return {
+        id,
+        x: this.player.position.x,
+        z: this.player.position.z,
+        yaw: this._cameraYaw(),
+        name: this._nameOf(id),
+      };
+    }
+    const entry = this.network.remoteStates && this.network.remoteStates.get(id);
+    if (!entry || !entry.s) return null;
+    return {
+      id,
+      x: Number(entry.s.x) || 0,
+      z: Number(entry.s.z) || 0,
+      yaw: Number(entry.s.yaw) || 0,
+      name: this._nameOf(id),
+    };
+  }
+
+  _allPlayers() {
+    const list = [{
+      id: this._selfId(),
+      x: this.player.position.x,
+      z: this.player.position.z,
+      yaw: this._cameraYaw(),
+      name: this._nameOf(this._selfId()),
+    }];
+    if (!this.network.remoteStates) return list;
+    for (const [id, entry] of this.network.remoteStates) {
+      if (!entry || !entry.s) continue;
+      // Записи удаляются при выходе игрока, поэтому давность пакета не
+      // проверяем: иначе на лагающем канале демон «теряет» цель.
+      list.push({
+        id,
+        x: Number(entry.s.x) || 0,
+        z: Number(entry.s.z) || 0,
+        yaw: Number(entry.s.yaw) || 0,
+        name: this._nameOf(id),
+      });
+    }
+    return list;
+  }
+
+  _closestPlayer() {
+    const npc = this.npc.root.position;
+    let best = null;
+    let bestDistance = Infinity;
+    for (const player of this._allPlayers()) {
+      if (this._deadIds.has(player.id)) continue;
+      const distance = Math.hypot(player.x - npc.x, player.z - npc.z);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = player;
+      }
+    }
+    return best;
+  }
+
+  _broadcastState(dt) {
+    if (!this._isHost()) return;
+    if (this.phase === DEMON_PHASE.IDLE || this.phase === DEMON_PHASE.INCOGNITO) return;
+    this._stateClock -= dt;
+    if (this._stateClock > 0) return;
+    this._stateClock = CONFIG.demon.stateInterval;
+    const position = this.npc.root.position;
+    this.network.sendDemon({
+      kind: 'state',
+      phase: this.phase,
+      x: Number(position.x.toFixed(3)),
+      z: Number(position.z.toFixed(3)),
+      yaw: Number(this.npc.yaw.toFixed(3)),
+      blood: Number(this.npc.blood.toFixed(2)),
+      drag: this._draggingId || null,
+    });
+  }
+
+  _onPeerJoined(player) {
+    if (!this._isHost() || !this.active || !player) return;
+    if (this.phase === DEMON_PHASE.IDLE || this.phase === DEMON_PHASE.INCOGNITO) return;
+    const position = this.npc.root.position;
+    this.network.sendDemon({
+      kind: 'sync',
+      phase: this.phase,
+      x: Number(position.x.toFixed(3)),
+      z: Number(position.z.toFixed(3)),
+      yaw: Number(this.npc.yaw.toFixed(3)),
+      blood: this.npc.blood,
+    }, player.id);
+  }
+
+  _onNetworkDemon(data = {}) {
+    if (!this.active || !data) return;
+    if (this._isHost()) {
+      if (data.kind === 'wake') {
+        if (data.from) this._beginReveal(data.source || 'voice', Boolean(data.stun));
+      } else if (data.kind === 'grab') {
+        this._hostGuestGrab(data.from);
+      } else if (data.kind === 'drag') {
+        this._hostGuestDrag(data.from, Boolean(data.active));
+      }
+      return;
+    }
+
+    if (data.kind === 'wake') {
+      this._applyReveal(data.source || 'voice', Boolean(data.stun));
+      return;
+    }
+    if (data.kind === 'state' || data.kind === 'sync') {
+      this._applyRemoteState(data);
+      return;
+    }
+    if (data.kind === 'kill') {
+      if (!data.target) return;
+      this._deadIds.add(data.target);
+      if (this.phase !== DEMON_PHASE.DEAD) {
+        // Пакет state мог не дойти до нас (например, канал только что открылся),
+        // но смерть всё равно должна выглядеть одинаково: кровь, тьма, визг.
+        if (this.phase === DEMON_PHASE.INCOGNITO) this._applyReveal('voice', false);
+        this.phase = DEMON_PHASE.DEAD;
+        this.npc.setPose('hunt');
+        this.onGameOver({ target: data.target, name: data.name || 'ПАССАЖИР' });
+      }
+    }
+  }
+
+  _applyRemoteState(data) {
+    if (!data.phase || data.phase === DEMON_PHASE.INCOGNITO) return;
+    if (this.phase === DEMON_PHASE.DEAD) return;
+
+    if (this.phase === DEMON_PHASE.INCOGNITO) {
+      this._applyReveal('voice', data.phase === DEMON_PHASE.STUNNED);
+      // Гость не тикает таймеры самостоятельно: всё придёт от хоста.
+      if (this.phase === DEMON_PHASE.STUNNED) this._stunTimer = 999;
+      if (this.phase === DEMON_PHASE.WAKING) this._wakeTimer = 999;
+    }
+
+    const incoming = data.phase;
+    if (incoming !== DEMON_PHASE.STUNNED && this._draggingId) {
+      this._endDrag({ silent: true });
+    } else if (
+      this._draggingId
+      && this._draggingId !== data.drag
+      && performance.now() - (this._dragStartedAt || 0) > 700
+    ) {
+      // Хост отпустил тело раньше нас (но не в первые кадры запроса).
+      this._endDrag({ silent: true });
+    }
+    this.phase = incoming;
+    this.npc.setBlood(typeof data.blood === 'number' ? data.blood : 1);
+    this.npc.setPose(
+      incoming === DEMON_PHASE.HUNTING
+        ? 'hunt'
+        : incoming === DEMON_PHASE.STUNNED || incoming === DEMON_PHASE.DEAD
+          ? 'ragdoll'
+          : 'waking',
+    );
+    if (typeof data.x === 'number') {
+      const isLocalDrag = this._draggingId === this._selfId();
+      if (!isLocalDrag) this.npc.root.position.set(data.x, 0, Number(data.z) || 0);
+    }
+    if (typeof data.yaw === 'number') this.npc.setYaw(data.yaw, true);
+    if (incoming === DEMON_PHASE.HUNTING && !this._guestHuntAnnounced) {
+      this._guestHuntAnnounced = true;
+      this.ui.showToast('ОН ВСТАЛ // БЕГИТЕ', 'error', 3600);
+    }
+    this.ui.setScare(true);
+    this.world.setBlackout(true);
+  }
+
+  _hostGuestGrab(fromId) {
+    if (!fromId || this.phase !== DEMON_PHASE.INCOGNITO) return;
+    const pose = this._playerPose(fromId);
+    if (!pose) return;
+    const npc = this.npc.root.position;
+    const distance = Math.hypot(pose.x - npc.x, pose.z - npc.z);
+    if (distance > CONFIG.npc.grabDistance + 0.7) return;
+    this._beginReveal('grab', true);
+  }
+
+  _hostGuestDrag(fromId, active) {
+    if (!fromId) return;
+    if (!active) {
+      if (this._draggingId === fromId) this._endDrag({ silent: true });
+      return;
+    }
+    if (this.phase !== DEMON_PHASE.STUNNED) return;
+    const pose = this._playerPose(fromId);
+    if (!pose) return;
+    const npc = this.npc.root.position;
+    const distance = Math.hypot(pose.x - npc.x, pose.z - npc.z);
+    if (distance > CONFIG.npc.grabDistance + 1.4) return;
+    this._draggingId = fromId;
+    this._stateClock = 0;
+  }
+}
+
 
 // =============================================================================
 // ИНТЕРФЕЙС
@@ -6595,6 +8193,8 @@ class UIManager {
     this._micTestActive = false;
     this._copyTimer = 0;
     this._lastCrewCount = 0;
+    this._promptKey = '';
+    this._promptTone = '';
     this._defaultStaminaCaption = 'SHIFT — БЕГ / ВЫНОСЛИВОСТЬ ВОССТАНАВЛИВАЕТСЯ В ПОКОЕ';
 
     this.el = {
@@ -6640,6 +8240,12 @@ class UIManager {
       vitals: $('#hud-vitals'),
       staminaCaption: $('.vitals-caption'),
       hints: $('#hud-hints'),
+      prompt: $('#hud-prompt'),
+      promptKey: $('#hud-prompt-key'),
+      promptText: $('#hud-prompt-text'),
+      listen: $('#hud-listen'),
+      listenText: $('#hud-listen-text'),
+      scare: $('#scare-overlay'),
 
       pauseResume: $('#btn-resume'),
       pauseSettings: $('#btn-pause-settings'),
@@ -6663,6 +8269,7 @@ class UIManager {
       lobbyCopy: $('#btn-copy-code'),
 
       ended: $('#modal-ended'),
+      endedKicker: $('#ended-kicker'),
       endedTitle: $('#ended-title'),
       endedText: $('#ended-text'),
       endedButton: $('#btn-ended-menu'),
@@ -7383,6 +8990,9 @@ class UIManager {
     this.el.hud.hidden = false;
     this.el.hud.classList.remove('is-paused');
     this.el.hints.classList.remove('is-faded');
+    this.hidePrompt();
+    this.setScare(false);
+    this.setListeningStatus({ mic: 'off', speech: 'off' });
     this.setLobbyCode(lobbyCode);
     this._startHaunt();
     this.setStamina({ value: CONFIG.player.staminaMax, max: CONFIG.player.staminaMax, sprinting: false, exhausted: false });
@@ -7396,6 +9006,8 @@ class UIManager {
 
   showMenu() {
     this._stopHaunt();
+    this.hidePrompt();
+    this.setScare(false);
     this.el.hud.hidden = true;
     this.el.pause.hidden = true;
     this.el.settings.hidden = true;
@@ -7642,7 +9254,7 @@ class UIManager {
     if (this.el.lobbyVoice) this.el.lobbyVoice.classList.toggle('is-ptt', Boolean(active));
   }
 
-  showEnded({ title, text }) {
+  showEnded({ title, text, kicker = null, dead = false }) {
     if (!this.el.ended) return;
     this.el.menu.hidden = true;
     this.el.join.hidden = true;
@@ -7650,7 +9262,12 @@ class UIManager {
     this._stopHaunt();
     this.el.hud.hidden = true;
     this.el.pause.hidden = true;
+    this.hidePrompt();
+    if (this.el.endedKicker) {
+      this.el.endedKicker.textContent = kicker || 'ЛОББИ БОЛЬШЕ НЕ СУЩЕСТВУЕТ';
+    }
     this.el.endedTitle.textContent = title;
+    this.el.endedTitle.classList.toggle('is-dead', Boolean(dead));
     this.el.endedText.textContent = text;
     this.el.ended.hidden = false;
     window.setTimeout(() => this.el.endedButton.focus({ preventScroll: true }), 40);
@@ -7680,6 +9297,71 @@ class UIManager {
     this.el.pause.hidden = true;
     this.el.hud.classList.remove('is-paused');
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Часть III: подсказка взаимодействия, «слух» и паника
+  // ---------------------------------------------------------------------------
+
+  showPrompt(text, key = 'E', tone = 'normal') {
+    if (!this.el.prompt) return;
+    const signature = `${tone}|${key}|${text}`;
+    if (signature === this._promptKey) return;
+    this._promptKey = signature;
+    this._promptTone = tone;
+    if (this.el.promptKey) {
+      this.el.promptKey.textContent = key || '';
+      this.el.promptKey.hidden = !key;
+    }
+    if (this.el.promptText) this.el.promptText.textContent = text;
+    this.el.prompt.dataset.tone = tone;
+    this.el.prompt.hidden = false;
+  }
+
+  hidePrompt() {
+    this._promptKey = '';
+    if (this.el.prompt) this.el.prompt.hidden = true;
+  }
+
+  /** Состояние микрофона: слушает ли вагон игрока и доступна ли речь. */
+  setListeningStatus({ mic = 'off', speech = 'off' } = {}) {
+    if (!this.el.listen) return;
+    let state = 'off';
+    let text = 'МИКРОФОН: ВЫКЛ';
+    if (mic === 'on') {
+      if (speech === 'listening') {
+        state = 'on';
+        text = 'САЛОН СЛУШАЕТ // РЕЧЬ';
+      } else if (speech === 'restarting') {
+        state = 'warn';
+        text = 'СЛУХ ВОССТАНАВЛИВАЕТСЯ…';
+      } else if (speech === 'unsupported') {
+        state = 'warn';
+        text = 'РЕЧЬ НЕДОСТУПНА // ТОЛЬКО КРИК';
+      } else if (speech === 'denied' || speech === 'error') {
+        state = 'warn';
+        text = 'РЕЧЬ ОТКЛЮЧЕНА // ТОЛЬКО КРИК';
+      } else if (speech === 'paused') {
+        state = 'off';
+        text = 'СЛУХ ПРИОСТАНОВЛЕН';
+      } else {
+        state = 'warn';
+        text = 'МИКРОФОН: ПОДКЛЮЧЕНИЕ…';
+      }
+    } else if (mic === 'denied') {
+      state = 'error';
+      text = 'МИКРОФОН ЗАПРЕЩЁН // ОН НЕ СЛЫШИТ';
+    } else if (mic === 'unsupported') {
+      state = 'error';
+      text = 'МИКРОФОН НЕДОСТУПЕН';
+    }
+    this.el.listen.dataset.state = state;
+    if (this.el.listenText) this.el.listenText.textContent = text;
+  }
+
+  setScare(active) {
+    if (this.el.scare) this.el.scare.classList.toggle('is-active', Boolean(active));
+    this.el.hud.classList.toggle('is-demon', Boolean(active));
   }
 
   setStamina(state) {
@@ -7872,7 +9554,28 @@ class Game {
       world: this.world,
     });
 
+    // Часть III: «уши» вагона и сам пассажир.
+    this.voiceWatcher = new VoiceWatcher({
+      audio: this.audio,
+      bus: this.bus,
+      config: CONFIG.speech,
+    });
+    this.demon = new DemonDirector({
+      scene: this.scene,
+      camera: this.camera,
+      world: this.world,
+      player: this.player,
+      audio: this.audio,
+      bus: this.bus,
+      network: this.network,
+      ui: this.ui,
+      watcher: this.voiceWatcher,
+      getPlayerName: () => this.store.values.callsign || 'ВЫ',
+      onGameOver: (payload) => this._onDemonGameOver(payload),
+    });
+
     this._localInCar = false;
+    this._demonDeath = false;
     this.network.setLocalStateProvider(() => {
       const state = this.player.getNetworkState();
       state.c = this._localInCar ? 1 : 0;
@@ -7936,6 +9639,9 @@ class Game {
     this.bus.on('network:warning', ({ message }) => this.ui.showToast(message, 'warning', 6000));
     this.bus.on('voice:lost', () => this.ui.showToast('МИКРОФОН ОТКЛЮЧЁН // ВОССТАНОВЛЕНИЕ КАНАЛА...', 'warning', 5000));
     this.bus.on('session:started', () => this.voice.setLocalInCar(true));
+
+    // Часть III: состояние «слуха» в HUD.
+    this.bus.on('speech:status', (status) => this.ui.setListeningStatus(status));
 
     // Усталость игрока притемняет салон — «дыхание» становится частью хоррора.
     this.bus.on('player:stamina', (state) => {
@@ -8153,6 +9859,8 @@ class Game {
     this.ui.enterGame(this.session ? this.session.code : this.network.session.code);
     this.audio.setScene('game');
     this.voice.setLocalInCar(true);
+    this.demon.activate();
+    this.voiceWatcher.start();
     this.clock.getDelta();
 
     const crew = Math.max(1, this.network.getPlayers().length);
@@ -8177,6 +9885,9 @@ class Game {
     this.player.setEnabled(false);
     this.player.unlock();
     this._localInCar = false;
+    this._demonDeath = false;
+    this.demon.reset();
+    this.voiceWatcher.stop();
     this.voice.leave();
     this.remotePlayers.clear();
     this.network.leave();
@@ -8196,12 +9907,28 @@ class Game {
       return;
     }
 
+    // Экран смерти уже показан: не подменяем его сообщением о выходе хоста,
+    // просто тихо снимаем сеанс с учёта. Кнопка «В главное меню» всё уберёт.
+    if (this._demonDeath) {
+      this.demon.reset();
+      this.voiceWatcher.stop();
+      this.voice.leave();
+      this.remotePlayers.clear();
+      this.session = null;
+      this.player.setEnabled(false);
+      this.player.unlock();
+      return;
+    }
+
     this._clearLockFallback();
     this.state = STATE.MENU;
     this._menuEnteredAt = performance.now();
     this.player.setEnabled(false);
     this.player.unlock();
     this._localInCar = false;
+    this._demonDeath = false;
+    this.demon.reset();
+    this.voiceWatcher.stop();
     this.voice.leave();
     this.remotePlayers.clear();
     this.session = null;
@@ -8228,12 +9955,59 @@ class Game {
 
   closeEndedScreen() {
     this.ui.hideEnded();
+    this._demonDeath = false;
+    // Экран смерти оставляет сеанс живым, чтобы остальные успели получить
+    // весть о смерти. Выход из лобби — уже по кнопке «В главное меню».
+    if (this.network.isActive || this.session) {
+      if (this.state !== STATE.MENU) {
+        this.leaveLobby();
+        return;
+      }
+      this.demon.reset();
+      this.voiceWatcher.stop();
+      this.voice.leave();
+      this.network.leave();
+      this.session = null;
+    }
     this.ui.showMenu();
     this.player.reset();
     this._setupMenuView();
     this.state = STATE.MENU;
     this._menuEnteredAt = performance.now();
     this.clock.getDelta();
+  }
+
+  /** Пассажир добрался до игрока: сеанс для него заканчивается. */
+  _onDemonGameOver({ target, name } = {}) {
+    if (this.state !== STATE.PLAYING && this.state !== STATE.PAUSED
+      && this.state !== STATE.DEPLOYING) {
+      return;
+    }
+    const isSelf = !target || target === this.network.selfId;
+    this._demonDeath = true;
+    this.state = STATE.PAUSED;
+    this.player.setEnabled(false);
+    this.player.setSpeedScale(1);
+    this.player.unlock();
+    this.demon.pause();
+    this.voiceWatcher.pause();
+    const victim = name || 'ПАССАЖИР';
+    this.audio.setScene('menu');
+    this.ui.showEnded({
+      title: isSelf ? 'МЁРТВ' : 'СЕАНС ОКОНЧЕН',
+      text: isSelf
+        ? 'Поезд не остановился. Пассажир без лица добрался до вас первым: '
+          + 'сигнал оборвался на полуслове, а состав идёт дальше без одного человека.'
+        : `Пассажир без лица добрался до цели: ${victim}. Вагон опустел — `
+          + 'двери закрыты, связь не отвечает, и поезд идёт дальше по расписанию.',
+      kicker: 'ВАГОН 06 // СИГНАЛ ПАССАЖИРА ОБОРВАН',
+      dead: true,
+    });
+    this.ui.showToast(
+      isSelf ? 'ОН НАШЁЛ ВАС // ИГРА ОКОНЧЕНА' : `${victim} МЁРТВ // ИГРА ОКОНЧЕНА`,
+      'error',
+      6000,
+    );
   }
 
   _requestPointerLock(initial = false) {
@@ -8265,6 +10039,8 @@ class Game {
     this._clearLockFallback();
     this.state = STATE.PAUSED;
     this.player.setEnabled(false);
+    this.demon.pause();
+    this.voiceWatcher.pause();
     this.audio.setScene('paused');
     this.ui.showPause({
       title: 'Вход в вагон',
@@ -8281,6 +10057,12 @@ class Game {
     this.audio.setScene('game');
     this.audio.hitch();
     this.clock.getDelta();
+
+    // Микрофон и пассажир оживают только когда игрок реально в салоне.
+    if (!this.demon.active) this.demon.activate();
+    if (!this.voiceWatcher.active) this.voiceWatcher.start();
+    else this.voiceWatcher.resume();
+
     this.bus.emit('session:started', this.session);
   }
 
@@ -8293,6 +10075,8 @@ class Game {
     if (this.state !== STATE.PLAYING) return;
     this.state = STATE.PAUSED;
     this.player.setEnabled(false);
+    this.demon.pause();
+    this.voiceWatcher.pause();
     this.audio.setScene('paused');
     this.ui.showPause();
     if (this.player.isLocked) this.player.unlock();
@@ -8333,6 +10117,9 @@ class Game {
     this.player.setEnabled(false);
     this.player.unlock();
     this._localInCar = false;
+    this._demonDeath = false;
+    this.demon.reset();
+    this.voiceWatcher.stop();
     this.voice.leave();
     this.remotePlayers.clear();
     this.network.leave();
@@ -8371,8 +10158,13 @@ class Game {
 
     if (this.state === STATE.PLAYING) {
       this.player.update(dt, this.elapsed);
+      // Пассажир думает после игрока: цель уже сдвинулась в этом кадре.
+      this.demon.update(dt, this.elapsed);
+      this.voiceWatcher.update(dt);
     } else if (this.state === STATE.MENU || this.state === STATE.LOBBY) {
       this._updateMenuCamera(this.elapsed);
+      // В меню пассажир просто сидит — анимация нужна и здесь.
+      this.demon.npc.update(dt, this.elapsed);
     }
 
     // Плавно подводим «атмосферную» усталость к цели.
@@ -8393,6 +10185,12 @@ class Game {
     window.cancelAnimationFrame(this._raf);
     this._clearLockFallback();
     window.clearTimeout(this._micProbeTimer);
+    try {
+      this.demon.reset();
+      this.voiceWatcher.stop();
+    } catch (error) {
+      /* ignore */
+    }
     try {
       this.voice.leave();
     } catch (error) {
@@ -8448,10 +10246,15 @@ function startGame() {
       NetworkManager,
       RemotePlayers,
       VoiceChat,
+      PassengerNPC,
+      VoiceWatcher,
+      DemonDirector,
       UIManager,
     },
     voice: game.voice,
     remotePlayers: game.remotePlayers,
+    voiceWatcher: game.voiceWatcher,
+    demon: game.demon,
   };
 
   window.addEventListener('pagehide', () => game.dispose(), { once: true });
