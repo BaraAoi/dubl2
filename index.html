@@ -13,8 +13,8 @@
   <script type="importmap">
   {
     "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/"
+      "three": "./vendor/three/three.module.js",
+      "three/addons/": "./vendor/three/addons/"
     }
   }
   </script>
@@ -1900,7 +1900,6 @@
       text-transform: uppercase;
       text-shadow: 0 1px 5px #000;
     }
-
     .hud-hints {
       position: absolute;
       right: clamp(18px, 3vw, 42px);
@@ -2487,6 +2486,55 @@
       letter-spacing: 0.02em;
     }
 
+    .net-select {
+      width: 100%;
+      min-width: 196px;
+      cursor: pointer;
+    }
+
+    .net-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .net-results {
+      list-style: none;
+      margin: 12px 0 0;
+      padding: 9px 11px;
+      border: 1px solid var(--line-soft);
+      background: rgba(0, 0, 0, 0.22);
+      font-size: 8px;
+      line-height: 1.9;
+      letter-spacing: 0.02em;
+      max-height: 158px;
+      overflow: auto;
+    }
+
+    .net-results li {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      white-space: nowrap;
+    }
+
+    .net-results li span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--ink-dim);
+    }
+
+    .net-results li[data-ok="true"] span:last-child {
+      color: var(--green);
+    }
+
+    .net-results li[data-ok="false"] span:last-child {
+      color: var(--red);
+    }
+
     .voice-hint--small {
       font-size: 8px;
       color: var(--ink-faint);
@@ -2775,8 +2823,8 @@
     }
 
     .lobby-footnote {
-      margin: 12px 0 0;
-      padding-top: 9px;
+      margin: 0;
+      padding: 10px clamp(14px, 2.2vw, 22px) 12px;
       border-top: 1px solid var(--line-soft);
       color: var(--ink-faint);
       font-size: 8px;
@@ -2784,6 +2832,19 @@
       letter-spacing: 0.05em;
       text-transform: uppercase;
       opacity: 0.85;
+    }
+
+    .lobby-footnote kbd {
+      display: inline-block;
+      min-width: 18px;
+      padding: 1px 4px;
+      border: 1px solid rgba(185, 247, 164, 0.18);
+      background: rgba(1, 4, 2, 0.36);
+      color: var(--ink-dim);
+      font-family: inherit;
+      font-size: 7px;
+      line-height: 1.2;
+      text-align: center;
     }
 
     .ended-title {
@@ -3552,6 +3613,61 @@
           </p>
         </div>
 
+        <div class="setting-section net-section">
+          <div class="setting-row">
+            <div class="setting-label">
+              <span class="setting-index" aria-hidden="true">05</span>
+              <div>
+                <h3 id="net-label">Канал связи</h3>
+                <p>Через какие узлы игроки находят друг друга. Голос и позиции идут напрямую, минуя сервер.</p>
+              </div>
+            </div>
+            <div class="setting-control">
+              <select class="text-input net-select" id="net-transport" aria-labelledby="net-label">
+                <option value="auto">Авто · обход блокировок</option>
+                <option value="mqtt">MQTT-реле</option>
+                <option value="torrent">WebTorrent</option>
+                <option value="nostr">Nostr</option>
+                <option value="peerjs">PeerJS (старый)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="net-actions">
+            <button type="button" class="btn-terminal" id="btn-net-test">
+              <span class="btn-dot" aria-hidden="true"></span>
+              <span id="btn-net-test-label">Проверить связь</span>
+            </button>
+            <span class="status-chip" id="net-status" data-state="idle" role="status" aria-live="polite">не проверено</span>
+          </div>
+
+          <ul class="net-results" id="net-results" hidden></ul>
+
+          <p class="voice-hint voice-hint--small" id="net-hint">
+            «Авто» перебирает MQTT, WebTorrent и Nostr, а если провайдер режет всё — откатывается на PeerJS Cloud.
+            Проверка показывает, какие узлы реально отвечают из вашей сети.
+          </p>
+
+          <label class="field-label field-label--spaced" for="relay-custom">
+            Свой relay-узел
+            <span>необязательно</span>
+          </label>
+          <input
+            class="text-input"
+            id="relay-custom"
+            name="relay-custom"
+            type="url"
+            inputmode="url"
+            maxlength="160"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="wss://broker.example.org:8084/mqtt"
+          >
+          <p class="voice-hint voice-hint--small">
+            Если публичные узлы недоступны, укажите адрес своего MQTT-брокера (wss://…/mqtt) или WebTorrent-трекера.
+          </p>
+        </div>
+
         <div class="definition-rule" aria-hidden="true">КОНЕЦ СЛУЖЕБНОГО РАЗДЕЛА</div>
 
         <div class="settings-footer">
@@ -3607,7 +3723,7 @@
 
           <div class="notice">
             <b>ПРЯМОЕ СОЕДИНЕНИЕ</b>
-            <span>Пассажиры связаны напрямую через PeerJS. Голос и координаты не проходят через игровой сервер — только через сигнальный узел.</span>
+            <span>Голос и координаты идут напрямую между браузерами. Реле-сети (MQTT, WebTorrent, Nostr) передают только рукопожатие — если ваш провайдер закрывает один канал, «Авто» найдёт другой.</span>
           </div>
 
           <p class="form-error" id="join-error" role="alert" hidden></p>
@@ -3669,12 +3785,12 @@
           <button type="button" class="btn-terminal btn-terminal--primary" id="btn-enter-car">Войти в салон</button>
         </div>
 
-        <p class="lobby-footnote">
-          Пока вы в лобби, вагон стоит. Внутри — тёмный салон, курсор захватывается мышью,
-          <kbd>WASD</kbd> — движение, <kbd>SHIFT</kbd> — бег, <kbd>ESC</kbd> — пауза,
-          <kbd>V</kbd> — рация (если выбран режим рации).
-        </p>
       </div>
+      <p class="lobby-footnote">
+        Пока вы в лобби, вагон стоит. Внутри — тёмный салон, курсор захватывается мышью,
+        <kbd>WASD</kbd> — движение, <kbd>SHIFT</kbd> — бег, <kbd>ESC</kbd> — пауза,
+        <kbd>V</kbd> — рация (если выбран режим рации).
+      </p>
     </div>
   </section>
 
@@ -3833,7 +3949,7 @@
   </script>
 
   <!-- PeerJS 1.5.5: сигнализация и WebRTC. UMD-сборка выставляет window.Peer. -->
-  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js" crossorigin="anonymous"></script>
+  <script src="./vendor/peerjs.min.js"></script>
 
   <script type="module" src="game.js"></script>
 
